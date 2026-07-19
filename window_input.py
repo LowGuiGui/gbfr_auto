@@ -1,41 +1,31 @@
 # -*- coding: utf-8 -*-
 """
-窗口级输入模拟
-使用 PostMessage/SendMessage 向指定窗口发送键盘鼠标消息
-不抢占系统焦点，不影响用户操作其他程序
+窗口级输入模拟（两种模式）
+  fallback : 切前台 + pynput 系统级模拟（游戏有效，会抢焦点）
+  inject   : DLL 注入目标进程 + 命名管道（游戏后台有效，不抢焦点，需编译 hook/gbfr_hook.dll）
 """
 
+import time
 import ctypes
 from ctypes import wintypes
 
 import win32con
 import win32gui
+from pynput.keyboard import Controller as KeyboardController, Key
+from pynput.mouse import Controller as MouseController, Button
 
 user32 = ctypes.windll.user32
 
-WM_KEYDOWN = 0x0100
-WM_KEYUP = 0x0101
-WM_CHAR = 0x0102
-WM_SYSKEYDOWN = 0x0104
-WM_SYSKEYUP = 0x0105
+_kc = KeyboardController()
+_mc = MouseController()
 
-WM_LBUTTONDOWN = 0x0201
-WM_LBUTTONUP = 0x0202
-WM_RBUTTONDOWN = 0x0204
-WM_RBUTTONUP = 0x0205
-WM_MBUTTONDOWN = 0x0207
-WM_MBUTTONUP = 0x0208
-WM_MOUSEMOVE = 0x0200
-
-MK_LBUTTON = 0x0001
-MK_RBUTTON = 0x0002
-MK_MBUTTON = 0x0010
-MK_SHIFT = 0x0004
-MK_CONTROL = 0x0008
-
-
-def _makelparam(x, y):
-    return ctypes.c_long((y << 16) | (x & 0xFFFF)).value
+KEYEVENTF_KEYUP = 0x0002
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
+MOUSEEVENTF_MIDDLEDOWN = 0x0020
+MOUSEEVENTF_MIDDLEUP = 0x0040
 
 
 def _to_vk(key):
@@ -85,60 +75,85 @@ def _to_vk(key):
     return ord(key_lower.upper())
 
 
-def key_press(hwnd, key):
-    vk = _to_vk(key)
-    lparam = 0x00000001
-    user32.PostMessageW(hwnd, WM_KEYDOWN, vk, lparam)
+def _to_pynput_key(key):
+    if isinstance(key, Key):
+        return key
+    key_lower = str(key).lower()
+    special = {
+        "enter": Key.enter,
+        "return": Key.enter,
+        "space": Key.space,
+        "esc": Key.esc,
+        "escape": Key.esc,
+        "tab": Key.tab,
+        "backspace": Key.backspace,
+        "back": Key.backspace,
+        "delete": Key.delete,
+        "del": Key.delete,
+        "insert": Key.insert,
+        "home": Key.home,
+        "end": Key.end,
+        "left": Key.left,
+        "right": Key.right,
+        "up": Key.up,
+        "down": Key.down,
+        "shift": Key.shift,
+        "ctrl": Key.ctrl,
+        "control": Key.ctrl,
+        "alt": Key.alt,
+        "menu": Key.alt,
+        "caps_lock": Key.caps_lock,
+    }
+    for i in range(1, 13):
+        special[f"f{i}"] = getattr(Key, f"f{i}")
+    if key_lower in special:
+        return special[key_lower]
+    if len(key_lower) == 1:
+        return key_lower
+    return key
 
 
-def key_release(hwnd, key):
-    vk = _to_vk(key)
-    lparam = 0xC0000001
-    user32.PostMessageW(hwnd, WM_KEYUP, vk, lparam)
+def _to_pynput_button(button):
+    mapping = {
+        "left": Button.left,
+        "right": Button.right,
+        "middle": Button.middle,
+    }
+    return mapping.get(button, Button.left)
 
 
-def key_tap(hwnd, key):
-    key_press(hwnd, key)
-    key_release(hwnd, key)
+def _sys_key(key, is_down):
+    pkey = _to_pynput_key(key)
+    if is_down:
+        _kc.press(pkey)
+    else:
+        _kc.release(pkey)
 
 
-def mouse_move(hwnd, x, y):
-    lparam = _makelparam(x, y)
-    user32.PostMessageW(hwnd, WM_MOUSEMOVE, 0, lparam)
-
-
-def mouse_press(hwnd, x, y, button="left"):
-    lparam = _makelparam(x, y)
-    if button == "left":
-        user32.PostMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
-    elif button == "right":
-        user32.PostMessageW(hwnd, WM_RBUTTONDOWN, MK_RBUTTON, lparam)
-    elif button == "middle":
-        user32.PostMessageW(hwnd, WM_MBUTTONDOWN, MK_MBUTTON, lparam)
-
-
-def mouse_release(hwnd, x, y, button="left"):
-    lparam = _makelparam(x, y)
-    if button == "left":
-        user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, lparam)
-    elif button == "right":
-        user32.PostMessageW(hwnd, WM_RBUTTONUP, 0, lparam)
-    elif button == "middle":
-        user32.PostMessageW(hwnd, WM_MBUTTONUP, 0, lparam)
-
-
-def mouse_click(hwnd, x, y, button="left"):
-    mouse_press(hwnd, x, y, button)
-    mouse_release(hwnd, x, y, button)
+def _sys_mouse(x, y, button, is_down):
+    _mc.position = (x, y)
+    pbtn = _to_pynput_button(button)
+    if is_down:
+        _mc.press(pbtn)
+    else:
+        _mc.release(pbtn)
 
 
 class WindowInput:
+    MODE_FALLBACK = "fallback"
+    MODE_INJECT = "inject"
+
     def __init__(self, hwnd_or_title=None):
         self._hwnd = None
+        self._mode = self.MODE_FALLBACK
+        self._hook_client = None
         if hwnd_or_title is not None:
             self.set_target(hwnd_or_title)
 
     def set_target(self, hwnd_or_title):
+        if hwnd_or_title is None:
+            self._hwnd = None
+            return
         if isinstance(hwnd_or_title, int):
             self._hwnd = hwnd_or_title
         else:
@@ -150,28 +165,150 @@ class WindowInput:
         return self._hwnd
 
     def is_ready(self):
+        if self._hwnd is None or not win32gui.IsWindow(self._hwnd):
+            return False
+        if self._mode == self.MODE_INJECT:
+            return self._hook_client is not None and self._hook_client.is_connected()
+        return True
+
+    def has_window(self):
         return self._hwnd is not None and win32gui.IsWindow(self._hwnd)
 
+    def _bring_to_front(self):
+        try:
+            if win32gui.IsIconic(self._hwnd):
+                win32gui.ShowWindow(self._hwnd, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(self._hwnd)
+            time.sleep(0.05)
+        except Exception:
+            pass
+
+    def _screen_pos(self, x, y):
+        rect = win32gui.GetWindowRect(self._hwnd)
+        return rect[0] + x, rect[1] + y
+
     def key_press(self, key):
-        if self.is_ready():
-            key_press(self._hwnd, key)
+        if not self.is_ready():
+            return
+        if self._mode == self.MODE_INJECT:
+            self._hook_client.key_press(_to_vk(key))
+        else:
+            self._bring_to_front()
+            _sys_key(key, True)
 
     def key_release(self, key):
-        if self.is_ready():
-            key_release(self._hwnd, key)
+        if not self.is_ready():
+            return
+        if self._mode == self.MODE_INJECT:
+            self._hook_client.key_release(_to_vk(key))
+        else:
+            _sys_key(key, False)
 
     def key_tap(self, key):
-        if self.is_ready():
-            key_tap(self._hwnd, key)
+        self.key_press(key)
+        time.sleep(0.05)
+        self.key_release(key)
 
     def mouse_press(self, x, y, button="left"):
-        if self.is_ready():
-            mouse_press(self._hwnd, x, y, button)
+        if not self.is_ready():
+            return
+        if self._mode == self.MODE_INJECT:
+            sx, sy = self._screen_pos(x, y)
+            self._hook_client.mouse_press(sx, sy, button)
+        else:
+            self._bring_to_front()
+            sx, sy = self._screen_pos(x, y)
+            _sys_mouse(sx, sy, button, True)
 
     def mouse_release(self, x, y, button="left"):
-        if self.is_ready():
-            mouse_release(self._hwnd, x, y, button)
+        if not self.is_ready():
+            return
+        if self._mode == self.MODE_INJECT:
+            sx, sy = self._screen_pos(x, y)
+            self._hook_client.mouse_release(sx, sy, button)
+        else:
+            sx, sy = self._screen_pos(x, y)
+            _sys_mouse(sx, sy, button, False)
 
     def mouse_click(self, x, y, button="left"):
-        if self.is_ready():
-            mouse_click(self._hwnd, x, y, button)
+        self.mouse_press(x, y, button)
+        time.sleep(0.05)
+        self.mouse_release(x, y, button)
+
+    def enable_fallback(self):
+        self._mode = self.MODE_FALLBACK
+
+    @property
+    def mode(self):
+        return self._mode
+
+    def enable_inject(self, dll_path=None, progress_cb=None):
+        import os
+        import sys
+        import time as _time
+        from hook.injector import (
+            HookClient, inject_dll, hwnd_to_pid,
+        )
+
+        def _log(msg):
+            if progress_cb:
+                progress_cb(msg)
+
+        if self._mode == self.MODE_INJECT and self._hook_client is not None:
+            if self._hook_client.is_connected():
+                _log("注入模式已就绪，无需重复启用")
+                return True
+            self._hook_client.disconnect()
+
+        if self._hwnd is None:
+            raise RuntimeError("请先设置目标窗口 (set_target)")
+
+        _log(f"目标窗口句柄: {self._hwnd}")
+
+        pid = hwnd_to_pid(self._hwnd)
+        if not pid:
+            raise RuntimeError(f"无法获取窗口 PID (hwnd={self._hwnd})")
+        _log(f"目标进程 PID: {pid}")
+
+        if dll_path is None:
+            base_dir = os.path.dirname(os.path.abspath(sys.argv[0])) \
+                if getattr(sys, "frozen", False) \
+                else os.path.dirname(os.path.abspath(__file__))
+            dll_path = os.path.join(base_dir, "hook", "gbfr_hook.dll")
+
+        if not os.path.exists(dll_path):
+            raise FileNotFoundError(
+                f"找不到 gbfr_hook.dll: {dll_path}\n"
+                f"请运行 hook/build.bat 编译 DLL"
+            )
+        _log(f"DLL 路径: {dll_path}")
+
+        self._hook_client = HookClient()
+        _log("正在创建命名管道服务器...")
+        if not self._hook_client.start_listening():
+            err = self._hook_client.last_error
+            self._hook_client = None
+            raise RuntimeError(f"创建命名管道失败: {err or '未知错误'}")
+        _log("命名管道服务器已启动，开始监听连接...")
+
+        _log("正在注入 DLL 到目标进程...")
+        inject_dll(pid, dll_path)
+        _log("DLL 注入完成，正在等待管道连接...")
+
+        if not self._hook_client.wait_for_connection(timeout_ms=5000):
+            err = self._hook_client.last_error
+            self._hook_client.disconnect()
+            self._hook_client = None
+            raise RuntimeError(
+                f"DLL 注入成功，但命名管道连接失败: {err or '未知错误'}\n"
+                f"(DLL 可能未正确启动，或管道名称不匹配)"
+            )
+        _log("命名管道连接成功，注入模式已就绪")
+        self._mode = self.MODE_INJECT
+        return True
+
+    def disable_inject(self):
+        if self._hook_client:
+            self._hook_client.disconnect()
+            self._hook_client = None
+        self._mode = self.MODE_FALLBACK
