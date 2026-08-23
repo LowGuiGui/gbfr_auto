@@ -226,9 +226,17 @@ def probe_gamepad(do_test):
     try:
         import vgamepad
     except ImportError:
-        say("  未安装 vgamepad。")
-        say("    pip install vgamepad     # 会一并装 ViGEmBus 驱动，需要管理员确认")
-        say("  >> 装好后重跑本脚本。")
+        say("  未安装 vgamepad —— 这一项无法在打包版里测。")
+        say()
+        say("  原因：虚拟手柄需要 ViGEmBus **内核驱动**装在这台机器上，打包一个 exe")
+        say("  绕不过去。而这个驱动本来就是功能 4 的前置条件，早晚要装。")
+        say()
+        say("  想测这一项的话，在这台机器上：")
+        say("    1. 装 Python 3.13")
+        say("    2. pip install vgamepad     # 会一并运行 ViGEmBus 驱动安装程序")
+        say("    3. python tools/windows_probe.py --gamepad-test")
+        say()
+        say("  上面 1-4 项不需要这一步，打包版就能全部跑完。")
         return
 
     say(f"  vgamepad 已安装: {getattr(vgamepad, '__version__', '版本未知')}")
@@ -274,7 +282,8 @@ def main():
         return 1
 
     say(f"gbfr_auto Windows 探测   {datetime.now():%Y-%m-%d %H:%M:%S}")
-    say(f"Python {sys.version.split()[0]}   {sys.platform}")
+    frozen = " (打包版)" if getattr(sys, "frozen", False) else ""
+    say(f"Python {sys.version.split()[0]}   {sys.platform}{frozen}")
 
     hwnd = probe_window(args.title)
     probe_dpi(hwnd)
@@ -293,6 +302,9 @@ def main():
         f.write("\n".join(report_lines) + "\n")
     say(f"报告已写入 {report}")
     say(f"截图在 {OUT_DIR}")
+    if getattr(sys, "frozen", False):
+        # 双击运行时不能让窗口一闪而过 —— 输出就是这个工具的全部意义
+        input("\n按 Enter 关闭... ")
     return 0
 
 
