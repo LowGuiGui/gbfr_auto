@@ -59,6 +59,28 @@ jobs:
       - name: ruff check
         run: ruff check --output-format=github .
 
+  test:
+    name: pytest (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      # pywin32 is markered out on Linux; everything else the suite needs
+      # installs fine. tests/conftest.py stubs the Windows boundary.
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: pytest
+        run: pytest -q
+
   build:
     name: build (windows-latest)
     runs-on: windows-latest
@@ -100,6 +122,12 @@ jobs:
       # import: main.py does all its work under `if __name__ == "__main__"`.
       - name: Import smoke test
         run: python -c "import main; print('imports OK')"
+
+      # The same suite, but here conftest's stubs do NOT engage -- the real
+      # win32/pyautogui/pynput modules are present, so this exercises the code
+      # against the actual platform it ships on. Worth more than the Linux run.
+      - name: pytest (against real win32 modules)
+        run: pytest -q
 
       # The README's command verbatim, plus --noconfirm for non-interactivity.
       - name: PyInstaller
