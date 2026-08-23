@@ -35,6 +35,19 @@
 pip install pyautogui pynput pillow opencv-python numpy
 ```
 
+## 编译 hook DLL（后台注入模式）
+
+后台注入模式需要 `hook/gbfr_hook.dll`，由 `hook/gbfr_hook.c` 编译生成。该文件**不纳入版本控制**——二进制无法 diff、无法审阅——所以从源码运行前需要自行编译一次：
+
+```bash
+cd hook
+build.bat
+```
+
+`build.bat` 会自动选择 Visual Studio Build Tools (`cl`) 或 MinGW (`gcc`)，两者任选其一即可。
+
+未编译时程序照常运行，只有启用注入模式会提示"找不到 gbfr_hook.dll"并指向本节。CI 构建产物与 Release 压缩包中已包含编译好的 DLL，直接下载使用则无需这一步。
+
 ## 使用方法
 
 1. 启动游戏并进入可重复战斗的界面
