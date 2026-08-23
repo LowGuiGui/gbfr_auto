@@ -1,0 +1,153 @@
+# Windows build for gbfr_auto.
+#
+# WHY THIS EXISTS: PyInstaller is not a cross-compiler. It bundles the host
+# platform's Python runtime, so a Windows .exe cannot be produced from Linux --
+# its own docs offer only that Wine "is said to be possible". The dev branch also
+# needs pywin32, which publishes no non-Windows wheels at all. Development here
+# happens on Linux, so a Windows runner is the only route to a build.
+#
+# Produces a directory laid out exactly as the app expects at runtime:
+#
+#     GBFR Auto.exe
+#     hook/gbfr_hook.dll
+#
+# The DLL must sit NEXT TO the .exe, not inside it: window_input.py resolves it
+# from dirname(sys.argv[0]) when frozen, which is the .exe's own directory --
+# PyInstaller's --add-data would unpack it to sys._MEIPASS instead, where nothing
+# looks for it. template/ is different: it IS bundled, and main.py extracts it on
+# first run.
+
+name: build-windows
+
+on:
+  push:
+    branches: [main, dev]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# Default to read-only. The release job raises this for itself alone.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Matches the local uv-managed venv. Every pinned dependency has a
+  # cp313-compatible win_amd64 wheel; numpy 2.5.2 rules out anything below 3.12.
+  PYTHON_VERSION: "3.13"
+  ARTIFACT_NAME: GBFR-Auto-windows-x64
+
+jobs:
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # ruff only. The runtime dependencies are Windows-only (pywin32) and ruff
+      # needs none of them -- it parses, it does not import.
+      - name: Install ruff
+        run: pip install "$(grep -E '^ruff==' requirements-dev.txt)"
+
+      - name: ruff check
+        run: ruff check --output-format=github .
+
+  build:
+    name: build (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      # Builds via the repo's own hook/build.bat so CI exercises the documented
+      # build path rather than a parallel one. Two guards around it:
+      #
+      #   - the tracked DLL is deleted first, so a stale binary cannot be mistaken
+      #     for a fresh build (and this keeps working once #6 untracks it);
+      #   - build.bat reports success unconditionally -- it never checks cl's exit
+      #     code -- so the DLL's existence is verified explicitly afterwards.
+      - name: Build hook/gbfr_hook.dll
+        shell: cmd
+        run: |
+          if exist "hook\gbfr_hook.dll" del /f /q "hook\gbfr_hook.dll"
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i"
+          if not defined VSPATH (echo No MSVC toolchain found on the runner. & exit /b 1)
+          call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cd hook
+          call build.bat || exit /b 1
+          if not exist "gbfr_hook.dll" (echo build.bat exited 0 but produced no DLL. & exit /b 1)
+          dir gbfr_hook.dll
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      # Catches a missing dependency here, with a readable traceback, rather than
+      # as a frozen .exe that dies on launch with no console (--windowed). Safe to
+      # import: main.py does all its work under `if __name__ == "__main__"`.
+      - name: Import smoke test
+        run: python -c "import main; print('imports OK')"
+
+      # The README's command verbatim, plus --noconfirm for non-interactivity.
+      - name: PyInstaller
+        shell: cmd
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name "GBFR Auto"
+          --uac-admin --icon "icon.ico"
+          --add-data "template;template" --add-data "icon.ico;."
+          main.py
+
+      - name: Stage the DLL beside the executable
+        shell: cmd
+        run: |
+          if not exist "dist\GBFR Auto.exe" (echo PyInstaller produced no executable. & exit /b 1)
+          mkdir "dist\hook"
+          copy /y "hook\gbfr_hook.dll" "dist\hook\gbfr_hook.dll" || exit /b 1
+          dir /s /b dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # the only job that writes; build stays read-only
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist
+
+      - name: Package
+        run: cd dist && zip -r "../${{ env.ARTIFACT_NAME }}-${{ github.ref_name }}.zip" .
+
+      # gh is preinstalled on the runner -- no third-party release action, and so
+      # no extra supply-chain surface for the one step holding a write token.
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: >
+          gh release create "${{ github.ref_name }}"
+          "${{ env.ARTIFACT_NAME }}-${{ github.ref_name }}.zip"
+          --title "${{ github.ref_name }}"
+          --generate-notes
