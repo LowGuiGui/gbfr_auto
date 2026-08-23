@@ -18,6 +18,10 @@ import win32pipe
 import win32security
 import pywintypes
 
+from applog import get_logger
+
+log = get_logger(__name__)
+
 PIPE_NAME = r"\\.\pipe\gbfr_hook"
 
 
@@ -26,6 +30,7 @@ def hwnd_to_pid(hwnd):
         _, pid = win32process.GetWindowThreadProcessId(hwnd)
         return pid
     except Exception:
+        log.warning("取窗口 PID 失败 (hwnd=%s)", hwnd, exc_info=True)
         return None
 
 
@@ -120,6 +125,7 @@ class HookClient:
         except Exception as e:
             self._last_error = f"CreateNamedPipe 异常: {e}"
             self._pipe = None
+            log.exception("CreateNamedPipe 异常")
         return self._pipe is not None
 
     def create_server(self):
@@ -147,7 +153,7 @@ class HookClient:
             try:
                 win32file.CloseHandle(self._pipe)
             except Exception:
-                pass
+                log.debug("关闭管道句柄失败", exc_info=True)
             self._pipe = None
             return False
         return True
@@ -171,7 +177,7 @@ class HookClient:
             try:
                 win32file.CloseHandle(self._pipe)
             except Exception:
-                pass
+                log.debug("关闭管道句柄失败", exc_info=True)
             self._pipe = None
             if wait_result == win32con.WAIT_TIMEOUT:
                 self._last_error = "等待命名管道连接超时"
@@ -198,11 +204,11 @@ class HookClient:
             try:
                 win32pipe.DisconnectNamedPipe(self._pipe)
             except Exception:
-                pass
+                log.debug("断开命名管道失败", exc_info=True)
             try:
                 win32file.CloseHandle(self._pipe)
             except Exception:
-                pass
+                log.debug("关闭管道句柄失败", exc_info=True)
             self._pipe = None
         self._connected = False
         self._thread = None
@@ -215,6 +221,9 @@ class HookClient:
             win32file.WriteFile(self._pipe, data)
             return True
         except Exception:
+            # 调用方多半不看返回值：这里静默失败就等于"按键没发出去，连接也断了"，
+            # 而界面上什么都不会显示。
+            log.warning("发送指令失败，注入连接已断开: %s", cmd, exc_info=True)
             self.disconnect()
             return False
 
@@ -238,5 +247,6 @@ class HookClient:
             resp, _ = win32file.ReadFile(self._pipe, 32)
             return b"PONG" in resp
         except Exception:
+            log.debug("PING 探活失败，判定连接已断", exc_info=True)
             self.disconnect()
             return False

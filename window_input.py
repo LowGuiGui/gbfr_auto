@@ -14,6 +14,10 @@ import win32gui
 from pynput.keyboard import Controller as KeyboardController, Key
 from pynput.mouse import Controller as MouseController, Button
 
+from applog import get_logger
+
+log = get_logger(__name__)
+
 user32 = ctypes.windll.user32
 
 _kc = KeyboardController()
@@ -181,7 +185,8 @@ class WindowInput:
             win32gui.SetForegroundWindow(self._hwnd)
             time.sleep(0.05)
         except Exception:
-            pass
+            # 同 window_capture：抢焦点被拒是常态，记 debug 就够。
+            log.debug("置顶窗口失败 (hwnd=%s)", self._hwnd, exc_info=True)
 
     def _screen_pos(self, x, y):
         rect = win32gui.GetWindowRect(self._hwnd)

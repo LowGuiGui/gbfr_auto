@@ -13,6 +13,10 @@ import win32con
 import win32gui
 from PIL import Image
 
+from applog import get_logger
+
+log = get_logger(__name__)
+
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
 
@@ -174,7 +178,8 @@ def _bring_to_front_and_capture(hwnd, region=None):
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
         win32gui.SetForegroundWindow(hwnd)
     except Exception:
-        pass
+        # Windows 会按规则拒绝抢焦点，这是常态而不是故障，所以只记 debug。
+        log.debug("置顶窗口失败 (hwnd=%s)，继续截图", hwnd, exc_info=True)
 
     import time
     time.sleep(0.2)
