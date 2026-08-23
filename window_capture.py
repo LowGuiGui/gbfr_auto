@@ -14,6 +14,7 @@ import win32gui
 from PIL import Image
 
 from applog import get_logger
+from opencv import is_blank_frame
 
 log = get_logger(__name__)
 
@@ -209,8 +210,14 @@ def capture_window(hwnd_or_title, region=None):
             return None
 
     img = _capture_printwindow(hwnd, region)
-    if img is not None:
+    if img is not None and not is_blank_frame(img):
         return img
+
+    if img is not None:
+        # PrintWindow 对 D3D 窗口经常"成功"返回一张全黑位图。原来的代码只在返回
+        # None 时才回退，于是黑帧被当成有效画面一路传下去 —— 而低纹理模板配全黑
+        # 画面会拿到 1.0 满分，最后是一次高置信度误判，不是"认不出页面"。
+        log.warning("PrintWindow 返回空白帧 (hwnd=%s)，改用前台截图", hwnd)
 
     return _bring_to_front_and_capture(hwnd, region)
 
