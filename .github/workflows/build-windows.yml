@@ -138,10 +138,22 @@ jobs:
           --add-data "template;template" --add-data "icon.ico;."
           main.py
 
+      # The diagnostic probe, shipped alongside so answering the open questions
+      # on a Windows machine needs no Python install there -- download, unzip,
+      # double-click. --console, not --windowed: the whole point is its output.
+      # No --uac-admin either; it is read-only and should not demand elevation.
+      - name: PyInstaller (probe)
+        shell: cmd
+        run: >
+          pyinstaller --noconfirm --onefile --console --name "gbfr-probe"
+          --icon "icon.ico"
+          tools/windows_probe.py
+
       - name: Stage the DLL beside the executable
         shell: cmd
         run: |
           if not exist "dist\GBFR Auto.exe" (echo PyInstaller produced no executable. & exit /b 1)
+          if not exist "dist\gbfr-probe.exe" (echo PyInstaller produced no probe. & exit /b 1)
           mkdir "dist\hook"
           copy /y "hook\gbfr_hook.dll" "dist\hook\gbfr_hook.dll" || exit /b 1
           dir /s /b dist
