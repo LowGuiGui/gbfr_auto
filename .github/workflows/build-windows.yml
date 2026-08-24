@@ -39,6 +39,8 @@ env:
   # cp313-compatible win_amd64 wheel; numpy 2.5.2 rules out anything below 3.12.
   PYTHON_VERSION: "3.13"
   ARTIFACT_NAME: GBFR-Auto-windows-x64
+  # Source of ViGEmClient.dll and the ViGEmBus installer bundled into the probe.
+  VGAMEPAD_VERSION: "0.1.0"
 
 jobs:
   lint:
@@ -138,15 +140,43 @@ jobs:
           --add-data "template;template" --add-data "icon.ico;."
           main.py
 
+      # Two binaries for the virtual-gamepad probe, taken from vgamepad's sdist
+      # (MIT, GPL-2.0 compatible). We extract the tarball rather than
+      # `pip install vgamepad`, because that package's setup.py unconditionally
+      # runs `msiexec /i ViGEmBusSetup.msi` at INSTALL time -- the skip flag
+      # exists only on its unreleased GitHub HEAD. Installing a kernel driver on
+      # a CI runner is not acceptable, and it would hang the build.
+      #
+      # Not committed to the repo: same rule as #6 -- binaries are fetched at
+      # build time, never versioned.
+      - name: Fetch ViGEm binaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = (Invoke-RestMethod 'https://pypi.org/pypi/vgamepad/${{ env.VGAMEPAD_VERSION }}/json').urls |
+                 Where-Object { $_.filename -like '*.tar.gz' } | Select-Object -First 1 -ExpandProperty url
+          Invoke-WebRequest $url -OutFile vgamepad.tar.gz
+          tar -xzf vgamepad.tar.gz
+          New-Item -ItemType Directory -Force -Path vigem | Out-Null
+          $base = "vgamepad-${{ env.VGAMEPAD_VERSION }}/vgamepad/win/vigem"
+          Copy-Item "$base/client/x64/ViGEmClient.dll"        vigem/
+          Copy-Item "$base/install/x64/ViGEmBusSetup_x64.msi" vigem/
+          Get-ChildItem vigem | Format-Table Name, Length
+          if (-not (Test-Path vigem/ViGEmClient.dll)) { throw 'ViGEmClient.dll missing' }
+          if (-not (Test-Path vigem/ViGEmBusSetup_x64.msi)) { throw 'installer missing' }
+
       # The diagnostic probe, shipped alongside so answering the open questions
       # on a Windows machine needs no Python install there -- download, unzip,
       # double-click. --console, not --windowed: the whole point is its output.
       # No --uac-admin either; it is read-only and should not demand elevation.
+      # The ViGEm binaries ride inside it so the gamepad test needs no setup.
       - name: PyInstaller (probe)
         shell: cmd
         run: >
           pyinstaller --noconfirm --onefile --console --name "gbfr-probe"
           --icon "icon.ico"
+          --add-data "vigem;vigem"
+          --paths tools
           tools/windows_probe.py
 
       - name: Stage the DLL beside the executable
