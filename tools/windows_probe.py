@@ -24,6 +24,10 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# 模块级导入而不是用到时再导：vigem 只依赖标准库，任何平台都能导入，而放在函数里
+# 会让 PyInstaller 的静态分析更容易漏掉它。
+import vigem  # noqa: E402
+
 DEFAULT_TITLE = "Granblue"
 REPORT_NAME = "gbfr-probe-report.txt"
 CAPTURE_NAME = "gbfr-probe-capture.png"
@@ -125,8 +129,28 @@ def probe_window(title_substring):
 
     win32gui.EnumWindows(_enum, None)
     if not matches:
-        say(f"找不到标题含 {title_substring!r} 的窗口。游戏开了吗？")
-        say("提示：--title 可以指定其它关键字。")
+        say(f"  找不到标题含 {title_substring!r} 的窗口。")
+        say()
+        # 双击运行的 exe 没法方便地传参数，所以直接把所有可见窗口标题列出来 ——
+        # 中文客户端或改过标题的情况，答案就在这份列表里，不用再跑一趟。
+        say("  当前所有可见窗口标题（游戏那一行就是要用的关键字）：")
+        titles = []
+
+        def _all(h, _):
+            if win32gui.IsWindowVisible(h):
+                text = win32gui.GetWindowText(h)
+                if text.strip():
+                    titles.append(text)
+            return True
+
+        win32gui.EnumWindows(_all, None)
+        for text in titles[:40]:
+            say(f"    {text!r}")
+        if len(titles) > 40:
+            say(f"    ...还有 {len(titles) - 40} 个")
+        say()
+        say("  游戏没开的话，先开游戏再跑一次。")
+        say("  标题对不上的话：gbfr-probe.exe --title \"其中一段\"")
         return None
     for h, text in matches:
         say(f"  hwnd={h}  title={text!r}")
@@ -234,27 +258,75 @@ def probe_capture(hwnd):
 # 4. 存档文件
 # --------------------------------------------------------------------------
 
+RELINK_APP_ID = "1090670"
+
+
+def steam_roots():
+    """找出 Steam 的安装目录。
+
+    注册表是唯一可靠的来源 —— 装在 D: 或任何自定义位置时，猜路径必然落空。
+    猜的那几条只作为注册表读不到时的兜底。
+    """
+    roots = []
+    try:
+        import winreg
+        for hive, key, value in (
+            (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", "SteamPath"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam", "InstallPath"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam", "InstallPath"),
+        ):
+            try:
+                with winreg.OpenKey(hive, key) as handle:
+                    path = winreg.QueryValueEx(handle, value)[0]
+                if path:
+                    roots.append((os.path.normpath(path), f"注册表 {value}"))
+            except OSError:
+                continue
+    except ImportError:
+        pass
+
+    for guess in (
+        os.path.expandvars(r"%ProgramFiles(x86)%\Steam"),
+        os.path.expandvars(r"%ProgramFiles%\Steam"),
+        r"C:\Steam",
+        os.path.expandvars(r"%USERPROFILE%\Steam"),
+    ):
+        roots.append((guess, "常见路径"))
+
+    seen = set()
+    unique = []
+    for path, source in roots:
+        key = path.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append((path, source))
+    return unique
+
+
 def probe_save():
     section("4. 存档文件 —— 功能 3B 的关键问题")
-    roots = [
-        os.path.expandvars(r"%ProgramFiles(x86)%\Steam\userdata"),
-        os.path.expandvars(r"%ProgramFiles%\Steam\userdata"),
-        r"C:\Steam\userdata",
-        os.path.expandvars(r"%USERPROFILE%\Steam\userdata"),
-    ]
+
     found = []
-    for root in roots:
-        if not os.path.isdir(root):
+    for root, source in steam_roots():
+        userdata = os.path.join(root, "userdata")
+        if not os.path.isdir(userdata):
             continue
-        for steam_id in os.listdir(root):
-            remote = os.path.join(root, steam_id, "1090670", "remote")
-            if os.path.isdir(remote):
-                for name in os.listdir(remote):
-                    found.append(os.path.join(remote, name))
+        say(f"  Steam 目录: {root}   （来源: {source}）")
+        for steam_id in os.listdir(userdata):
+            remote = os.path.join(userdata, steam_id, RELINK_APP_ID, "remote")
+            if not os.path.isdir(remote):
+                continue
+            for name in os.listdir(remote):
+                found.append(os.path.join(remote, name))
 
     if not found:
-        say("  没找到存档目录。手动找找：")
-        say(r"    <Steam>\userdata\<SteamID>\1090670\remote\ ")
+        say("  没找到存档。查过的位置：")
+        for root, source in steam_roots():
+            mark = "存在" if os.path.isdir(os.path.join(root, "userdata")) else "不存在"
+            say(f"    [{mark}] {os.path.join(root, 'userdata')}   ({source})")
+        say()
+        say(f"  手动找找：<Steam>\\userdata\\<SteamID>\\{RELINK_APP_ID}\\remote\\")
+        say("  找到的话请把完整路径贴回来。")
         return
 
     for path in found:
@@ -285,8 +357,6 @@ def probe_save():
 
 def probe_gamepad(do_test):
     section("5. 虚拟手柄 —— 这是功能 4 的方案")
-    import vigem
-
     dll = vigem.client_dll_path()
     if not os.path.exists(dll):
         say(f"  内置的 ViGEmClient.dll 不在: {dll}")
@@ -364,7 +434,25 @@ def run_all(args):
         section("3. 截图后端")
         say("  跳过：没找到游戏窗口。")
     probe_save()
-    probe_gamepad(args.gamepad_test)
+    probe_gamepad(args.gamepad_test or ask_gamepad_test(args))
+
+
+def ask_gamepad_test(args):
+    """打包版双击运行时没法传参数，所以在这里问一句。
+
+    只在打包版、且用户没显式给过 --gamepad-test 时才问；命令行运行保持非交互。
+    """
+    if args.gamepad_test or not getattr(sys, "frozen", False):
+        return False
+    print()
+    print("  手柄测试会向游戏推 5 秒左摇杆（其余检查都是只读的）。")
+    try:
+        answer = input("  要做手柄测试吗？(y/N) ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    chose = answer in ("y", "yes", "是")
+    say(f"  [交互] 手柄测试: {'要做' if chose else '跳过'}")
+    return chose
 
 
 def pause_if_frozen():
