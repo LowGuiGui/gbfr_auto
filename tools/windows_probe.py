@@ -18,7 +18,9 @@ import sys
 import time
 from datetime import datetime
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_HERE))   # 仓库根：opencv / window_capture
+sys.path.insert(0, _HERE)                    # 同目录：vigem
 
 OUT_DIR = os.path.join(os.getcwd(), "probe-out")
 DEFAULT_TITLE = "Granblue"
@@ -221,60 +223,94 @@ def probe_save():
 # 5. 虚拟手柄
 # --------------------------------------------------------------------------
 
-def probe_gamepad(do_test):
+def probe_gamepad(do_test, do_install):
     section("5. 虚拟手柄 —— 这是功能 4 的方案")
-    try:
-        import vgamepad
-    except ImportError:
-        say("  未安装 vgamepad —— 这一项无法在打包版里测。")
-        say()
-        say("  原因：虚拟手柄需要 ViGEmBus **内核驱动**装在这台机器上，打包一个 exe")
-        say("  绕不过去。而这个驱动本来就是功能 4 的前置条件，早晚要装。")
-        say()
-        say("  想测这一项的话，在这台机器上：")
-        say("    1. 装 Python 3.13")
-        say("    2. pip install vgamepad     # 会一并运行 ViGEmBus 驱动安装程序")
-        say("    3. python tools/windows_probe.py --gamepad-test")
-        say()
-        say("  上面 1-4 项不需要这一步，打包版就能全部跑完。")
+    import vigem
+
+    dll = vigem.client_dll_path()
+    if not os.path.exists(dll):
+        say(f"  内置的 ViGEmClient.dll 不在: {dll}")
+        say("  >> 这个版本没打包手柄支持。用 CI 产出的发行包。")
         return
 
-    say(f"  vgamepad 已安装: {getattr(vgamepad, '__version__', '版本未知')}")
+    installed, version = vigem.driver_installed()
+    if installed is None:
+        say("  查询注册表失败，无法判断驱动是否已装。直接试连。")
+    elif installed:
+        say(f"  ViGEmBus 驱动: 已安装 {version or '(版本未知)'}")
+    else:
+        say("  ViGEmBus 驱动: 未安装")
+        say()
+        say("  这是个内核驱动，虚拟手柄要靠它。安装包已经内置在本程序里，")
+        say("  来自 vgamepad 的官方发布（MIT）。装它需要管理员权限，")
+        say("  会弹出微软的安装向导。")
+        say()
+        if not do_install:
+            say("  要装的话，重新运行并加上 --install-driver：")
+            say("      gbfr-probe.exe --install-driver --gamepad-test")
+            return
+        say(f"  安装包: {vigem.installer_path()}")
+        answer = input("  现在启动安装程序？(yes/no) ").strip().lower()
+        if answer not in ("y", "yes", "是"):
+            say("  已取消，未做任何改动。")
+            return
+        ok, message = vigem.launch_installer()
+        say(f"  {message}")
+        if not ok:
+            return
+        installed, version = vigem.driver_installed()
+        say(f"  重新检测: {'已安装 ' + (version or '') if installed else '仍未检测到'}")
+        if not installed:
+            say("  >> 装完可能需要重启。重启后再跑一次本程序。")
+            return
+
     try:
-        pad = vgamepad.VX360Gamepad()
+        pad = vigem.VirtualGamepad()
+        pad.connect()
     except Exception as e:
-        say(f"  创建虚拟手柄失败: {e!r}")
-        say("  >> ViGEmBus 驱动没装好。")
-        return
-    say("  >> 虚拟 Xbox360 手柄创建成功，系统已识别。")
-    say("     它读的是设备状态，不是窗口消息 —— 天然不需要焦点，也不碰鼠标键盘。")
-
-    if not do_test:
-        say()
-        say("  加 --gamepad-test 可以真的按一下按钮（会向游戏发输入）。")
+        say(f"  创建虚拟手柄失败: {e}")
+        say("  >> 驱动没装好，或者版本不匹配。")
         return
 
-    say()
-    say("  即将按 5 秒左摇杆向前。请把游戏切到前台，看角色是否移动。")
-    say("  然后 Alt-Tab 切走，再跑一次 —— 后台还动，就说明整件事成立。")
-    input("  按 Enter 开始，Ctrl-C 取消... ")
     try:
-        pad.left_joystick_float(x_value_float=0.0, y_value_float=1.0)
-        pad.update()
-        for i in range(5, 0, -1):
-            print(f"    ...{i}", end="\r", flush=True)
-            time.sleep(1)
+        say("  >> 虚拟 Xbox360 手柄创建成功，系统已识别它。")
+        say("     它走的是设备状态（XInput），不是窗口消息 —— 天然不需要焦点，")
+        say("     也完全不碰你的鼠标和键盘。这正是功能 4 想要的性质。")
+
+        if not do_test:
+            say()
+            say("  加 --gamepad-test 会真的推一次摇杆（向游戏发输入）。")
+            return
+
+        say()
+        say("  即将推左摇杆向前 5 秒。")
+        say("  第一次：让游戏在前台，看角色动不动。")
+        say("  第二次：Alt-Tab 切走再跑一遍 —— 后台还动，整件事就成立了。")
+        try:
+            input("  按 Enter 开始，Ctrl-C 取消... ")
+        except KeyboardInterrupt:
+            say("  已取消。")
+            return
+        try:
+            pad.left_stick_forward()
+            for i in range(5, 0, -1):
+                print(f"    ...{i}", end="\r", flush=True)
+                time.sleep(1)
+        finally:
+            pad.neutral()
+        say("  已回中。角色动了吗？动了 = 功能 4 有解，hook/ 整个可以删。")
     finally:
-        pad.reset()
-        pad.update()
-    say("  已松开。角色动了吗？动了 = 功能 4 有解。")
+        # 一定要拔掉，否则虚拟手柄会留在系统里，摇杆还推着
+        pad.close()
 
 
 def main():
     parser = argparse.ArgumentParser(description="gbfr_auto Windows 现场探测")
     parser.add_argument("--title", default=DEFAULT_TITLE, help="游戏窗口标题关键字")
     parser.add_argument("--gamepad-test", action="store_true",
-                        help="真的发一次手柄输入（默认只检测能否创建）")
+                        help="真的推一次摇杆（默认只检测能否创建虚拟手柄）")
+    parser.add_argument("--install-driver", action="store_true",
+                        help="缺 ViGEmBus 驱动时，启动内置的官方安装程序（会先问一遍）")
     args = parser.parse_args()
 
     if not sys.platform.startswith("win"):
@@ -293,7 +329,7 @@ def main():
         section("3. 截图后端")
         say("  跳过：没找到游戏窗口。")
     probe_save()
-    probe_gamepad(args.gamepad_test)
+    probe_gamepad(args.gamepad_test, args.install_driver)
 
     section("完成")
     os.makedirs(OUT_DIR, exist_ok=True)
