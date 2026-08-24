@@ -174,13 +174,67 @@ jobs:
       # No --uac-admin either; it is read-only and should not demand elevation.
       # ViGEmClient.dll rides inside it, so the gamepad check needs no setup
       # beyond the driver itself.
+      # --paths . is load-bearing. The script lives in tools/, so PyInstaller adds
+      # tools/ to its search path -- but vigem.py, opencv.py and window_capture.py
+      # are at the repo root. The sys.path.insert the script does at runtime is
+      # invisible to static analysis, so without this the modules are simply not
+      # bundled and the exe dies at import with ModuleNotFoundError.
       - name: PyInstaller (probe)
         shell: cmd
         run: >
           pyinstaller --noconfirm --onefile --console --name "gbfr-probe"
           --icon "icon.ico"
           --add-data "vigem_bin;vigem_bin"
+          --paths .
           tools/windows_probe.py
+
+      # PyInstaller writes "missing module named X" into build/<name>/warn-*.txt
+      # and exits 0. That file is why a probe with no vigem module built cleanly
+      # and only failed on the user's machine. Read it, and fail on OUR modules
+      # -- third-party optional imports warn constantly and are not our problem.
+      - name: Check PyInstaller found our own modules
+        shell: pwsh
+        run: |
+          $warn = "build/gbfr-probe/warn-gbfr-probe.txt"
+          if (-not (Test-Path $warn)) { throw "no PyInstaller warning file at $warn" }
+          $ours = 'vigem', 'opencv', 'window_capture', 'applog', 'config'
+          $bad = Get-Content $warn | Where-Object {
+            $line = $_
+            ($line -match '^missing module named ([A-Za-z_][A-Za-z0-9_]*)') -and
+            ($ours -contains $Matches[1])
+          }
+          if ($bad) {
+            Write-Host "PyInstaller could not find modules that belong to this repo:"
+            $bad | ForEach-Object { Write-Host "  $_" }
+            throw "probe build is missing repo modules -- check --paths"
+          }
+          Write-Host "All repo modules resolved."
+
+      # Run the thing we just built. PyInstaller only WARNS about modules it
+      # could not find, so a broken exe builds "successfully" and the failure
+      # surfaces on the user's machine instead. There is no game and no Steam on
+      # the runner, so the probe reports plenty of absences -- what matters is
+      # that it starts, finishes, and writes a report.
+      - name: Smoke-test the probe executable
+        shell: cmd
+        run: |
+          cd dist
+          "gbfr-probe.exe" < nul
+          if errorlevel 1 (echo Probe exited non-zero. & type gbfr-probe-report.txt & exit /b 1)
+          if not exist "gbfr-probe-report.txt" (echo Probe wrote no report. & exit /b 1)
+          findstr /c:"ABORTED" gbfr-probe-report.txt >nul && (
+            echo Probe aborted:
+            type gbfr-probe-report.txt
+            exit /b 1
+          )
+          findstr /c:"[FAIL]" gbfr-probe-report.txt >nul && (
+            echo A dependency failed to import inside the packaged probe:
+            type gbfr-probe-report.txt
+            exit /b 1
+          )
+          echo Probe ran clean.
+          type gbfr-probe-report.txt
+          del gbfr-probe-report.txt
 
       - name: Stage the DLL beside the executable
         shell: cmd
