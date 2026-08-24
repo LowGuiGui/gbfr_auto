@@ -7,8 +7,11 @@ PLANNING.md §5 列了六个问题，都只能在 Windows 上、开着游戏才�
     python tools/windows_probe.py                 # 只读，不发任何输入
     python tools/windows_probe.py --gamepad-test  # 额外做虚拟手柄测试（会发输入）
 
-只读。除了往 probe-out/ 写截图和报告之外，什么都不改：不动存档、不动配置、
+只读。除了往当前文件夹写一份报告和一张截图之外，什么都不改：不动存档、不动配置、
 不动游戏。手柄测试必须显式开启，且会先问一遍。
+
+报告是逐行落盘的，不是最后一次性写出去 —— 中途崩掉也要留下已经查到的东西，
+否则双击运行时窗口一闪而过，什么线索都不剩。
 """
 
 import argparse
@@ -16,19 +19,75 @@ import ctypes
 import os
 import sys
 import time
+import traceback
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-OUT_DIR = os.path.join(os.getcwd(), "probe-out")
 DEFAULT_TITLE = "Granblue"
+REPORT_NAME = "gbfr-probe-report.txt"
+CAPTURE_NAME = "gbfr-probe-capture.png"
 
-report_lines = []
+# 输出目录和报告文件句柄，在 main() 最开始就定好。
+OUT_DIR = None
+_report = None
+
+
+def output_dir():
+    """报告写到哪。
+
+    双击 exe 时"当前文件夹"就是 exe 所在目录，所以首选那里 —— 从别处用命令行
+    启动时 cwd 可能是任意位置，写到那里等于文件失踪。装在只读位置时依次退回
+    cwd 和临时目录。
+    """
+    if getattr(sys, "frozen", False):
+        preferred = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        preferred = os.getcwd()
+
+    import tempfile
+    for candidate in (preferred, os.getcwd(), tempfile.gettempdir()):
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            probe = os.path.join(candidate, ".gbfr_probe_write_test")
+            with open(probe, "w"):
+                pass
+            os.remove(probe)
+            return candidate
+        except OSError:
+            continue
+    return None
+
+
+def open_report():
+    """在任何探测开始之前就把报告文件打开。
+
+    原来是把所有行攒在内存里，最后一次性写出去 —— 中间任何一处抛异常，文件就
+    根本不存在，窗口一闪而过，什么线索都不留。现在每行立刻落盘。
+    """
+    global OUT_DIR, _report
+    OUT_DIR = output_dir()
+    if OUT_DIR is None:
+        print("警告: 找不到可写目录，本次只在屏幕上显示，不会留下报告文件。")
+        return None
+    path = os.path.join(OUT_DIR, REPORT_NAME)
+    try:
+        _report = open(path, "w", encoding="utf-8")
+    except OSError as e:
+        print(f"警告: 无法写入报告 {path}: {e}")
+        _report = None
+        return None
+    return path
 
 
 def say(line=""):
     print(line)
-    report_lines.append(line)
+    if _report is not None:
+        try:
+            _report.write(line + "\n")
+            _report.flush()      # 每行都刷盘：崩了也能留住已经查到的部分
+        except OSError:
+            pass
 
 
 def section(title):
@@ -141,9 +200,6 @@ def probe_capture(hwnd):
     from opencv import is_blank_frame
     from window_capture import _capture_printwindow
 
-    os.makedirs(OUT_DIR, exist_ok=True)
-    stamp = datetime.now().strftime("%H%M%S")
-
     say("  [PrintWindow] 后台截图，不抢焦点 —— 我们想要的那条路")
     try:
         img = _capture_printwindow(hwnd)
@@ -155,10 +211,16 @@ def probe_capture(hwnd):
         say("    返回 None —— 失败。")
         say("    >> 需要改用 Windows.Graphics.Capture (WGC)。")
     else:
-        path = os.path.join(OUT_DIR, f"printwindow-{stamp}.png")
-        img.save(path)
         blank = is_blank_frame(img)
-        say(f"    返回 {img.size[0]}x{img.size[1]}，已存到 {path}")
+        path = os.path.join(OUT_DIR, CAPTURE_NAME) if OUT_DIR else None
+        if path:
+            try:
+                img.save(path)
+            except (OSError, ValueError) as e:
+                say(f"    截图保存失败: {e}")
+                path = None
+        say(f"    返回 {img.size[0]}x{img.size[1]}"
+            + (f"，已存到 {path}" if path else "（未能保存）"))
         say(f"    空白帧判定: {blank}")
         if blank:
             say("    >> 全黑：PrintWindow 拿不到这个 D3D 窗口。需要 WGC。")
@@ -288,17 +350,8 @@ def probe_gamepad(do_test):
         pad.close()
 
 
-def main():
-    parser = argparse.ArgumentParser(description="gbfr_auto Windows 现场探测")
-    parser.add_argument("--title", default=DEFAULT_TITLE, help="游戏窗口标题关键字")
-    parser.add_argument("--gamepad-test", action="store_true",
-                        help="真的推一次摇杆（默认只检测能否创建虚拟手柄）")
-    args = parser.parse_args()
-
-    if not sys.platform.startswith("win"):
-        print("这个脚本只能在 Windows 上跑。")
-        return 1
-
+def run_all(args):
+    """跑完所有探测。任何一段抛出的异常由 main() 兜住并写进报告。"""
     say(f"gbfr_auto Windows 探测   {datetime.now():%Y-%m-%d %H:%M:%S}")
     frozen = " (打包版)" if getattr(sys, "frozen", False) else ""
     say(f"Python {sys.version.split()[0]}   {sys.platform}{frozen}")
@@ -313,17 +366,54 @@ def main():
     probe_save()
     probe_gamepad(args.gamepad_test)
 
-    section("完成")
-    os.makedirs(OUT_DIR, exist_ok=True)
-    report = os.path.join(OUT_DIR, "probe-report.txt")
-    with open(report, "w", encoding="utf-8") as f:
-        f.write("\n".join(report_lines) + "\n")
-    say(f"报告已写入 {report}")
-    say(f"截图在 {OUT_DIR}")
-    if getattr(sys, "frozen", False):
-        # 双击运行时不能让窗口一闪而过 —— 输出就是这个工具的全部意义
+
+def pause_if_frozen():
+    """双击运行时别让窗口一闪而过 —— 输出就是这个工具的全部意义。"""
+    if not getattr(sys, "frozen", False):
+        return
+    try:
         input("\n按 Enter 关闭... ")
-    return 0
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
+def main():
+    parser = argparse.ArgumentParser(description="gbfr_auto Windows 现场探测")
+    parser.add_argument("--title", default=DEFAULT_TITLE, help="游戏窗口标题关键字")
+    parser.add_argument("--gamepad-test", action="store_true",
+                        help="真的推一次摇杆（默认只检测能否创建虚拟手柄）")
+    args = parser.parse_args()
+
+    if not sys.platform.startswith("win"):
+        print("这个脚本只能在 Windows 上跑。")
+        pause_if_frozen()
+        return 1
+
+    report_path = open_report()
+    status = 0
+    try:
+        run_all(args)
+        section("完成")
+    except KeyboardInterrupt:
+        section("已中断")
+        say("用户按了 Ctrl-C。上面已经查到的部分仍然有效。")
+        status = 130
+    except BaseException:
+        # 崩溃本身就是最有价值的信息，必须进报告 —— 否则窗口一关就什么都没了。
+        section("探测中断：出现未预期的错误")
+        say("下面这段请一并贴回来：")
+        say()
+        for line in traceback.format_exc().rstrip().splitlines():
+            say("  " + line)
+        status = 1
+    finally:
+        if report_path:
+            say()
+            say(f"报告: {report_path}")
+        if _report is not None:
+            _report.close()
+        pause_if_frozen()
+    return status
 
 
 if __name__ == "__main__":
