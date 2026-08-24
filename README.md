@@ -44,7 +44,9 @@ pip install pyautogui pynput pillow opencv-python numpy
 - 后台截图能不能拿到真实画面（会把截到的图存下来供确认）
 - 存档文件在哪、有多大、什么时候写的
 
-开着游戏双击运行即可。结果写在 exe 同目录下的 `gbfr-probe-report.txt`，截图写成 `gbfr-probe-capture.png`。识别不正常时，先跑它。
+**先开游戏**，再双击运行。结果写在 exe 同目录下的 `gbfr-probe-report.txt`，截图写成 `gbfr-probe-capture.png`。识别不正常时，先跑它。
+
+找不到游戏窗口时，它会把当前所有可见窗口的标题列出来 —— 中文客户端或改过标题的情况，直接用 `--title "其中一段"` 指定即可。跑完还会问一句要不要做虚拟手柄测试。
 
 报告是逐行落盘的：即使中途出错，已经查到的部分和错误堆栈也都会留在文件里，把它整个贴出来即可。
 

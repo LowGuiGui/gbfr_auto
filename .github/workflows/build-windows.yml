@@ -162,11 +162,11 @@ jobs:
                  Where-Object { $_.filename -like '*.tar.gz' } | Select-Object -First 1 -ExpandProperty url
           Invoke-WebRequest $url -OutFile vgamepad.tar.gz
           tar -xzf vgamepad.tar.gz
-          New-Item -ItemType Directory -Force -Path vigem | Out-Null
+          New-Item -ItemType Directory -Force -Path vigem_bin | Out-Null
           $base = "vgamepad-${{ env.VGAMEPAD_VERSION }}/vgamepad/win/vigem"
-          Copy-Item "$base/client/x64/ViGEmClient.dll" vigem/
-          Get-ChildItem vigem | Format-Table Name, Length
-          if (-not (Test-Path vigem/ViGEmClient.dll)) { throw 'ViGEmClient.dll missing' }
+          Copy-Item "$base/client/x64/ViGEmClient.dll" vigem_bin/
+          Get-ChildItem vigem_bin | Format-Table Name, Length
+          if (-not (Test-Path vigem_bin/ViGEmClient.dll)) { throw 'ViGEmClient.dll missing' }
 
       # The diagnostic probe, shipped alongside so answering the open questions
       # on a Windows machine needs no Python install there -- download, unzip,
@@ -179,7 +179,7 @@ jobs:
         run: >
           pyinstaller --noconfirm --onefile --console --name "gbfr-probe"
           --icon "icon.ico"
-          --add-data "vigem;vigem"
+          --add-data "vigem_bin;vigem_bin"
           tools/windows_probe.py
 
       - name: Stage the DLL beside the executable

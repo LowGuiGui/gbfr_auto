@@ -142,3 +142,101 @@ def test_non_windows_exits_cleanly(monkeypatch, capsys):
     monkeypatch.delattr(sys, "frozen", raising=False)
     assert probe.main() == 1
     assert "只能在 Windows" in capsys.readouterr().out
+
+
+class TestSteamDiscovery:
+    """猜四条路径的话，Steam 装在 D: 的人直接得到"没找到"。"""
+
+    def test_registry_values_come_first(self, monkeypatch):
+        import types
+        fake = types.ModuleType("winreg")
+        fake.HKEY_CURRENT_USER = 1
+        fake.HKEY_LOCAL_MACHINE = 2
+
+        class Key:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def open_key(hive, path):
+            if hive == 1:
+                return Key()
+            raise OSError("no such key")
+
+        fake.OpenKey = open_key
+        fake.QueryValueEx = lambda handle, name: (r"D:\SteamLibrary\Steam", 1)
+        monkeypatch.setitem(sys.modules, "winreg", fake)
+
+        roots = probe.steam_roots()
+        assert roots[0][0] == os.path.normpath(r"D:\SteamLibrary\Steam")
+        assert "注册表" in roots[0][1]
+
+    def test_guesses_remain_as_fallback(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "winreg", None)
+        roots = probe.steam_roots()
+        assert roots, "注册表读不到时仍要有兜底路径"
+        assert all(source == "常见路径" for _, source in roots)
+
+    def test_duplicates_are_collapsed(self, monkeypatch):
+        import types
+        fake = types.ModuleType("winreg")
+        fake.HKEY_CURRENT_USER = 1
+        fake.HKEY_LOCAL_MACHINE = 2
+
+        class Key:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        fake.OpenKey = lambda hive, path: Key()
+        fake.QueryValueEx = lambda handle, name: (r"C:\Steam", 1)
+        monkeypatch.setitem(sys.modules, "winreg", fake)
+
+        paths = [p.lower() for p, _ in probe.steam_roots()]
+        assert len(paths) == len(set(paths))
+
+    def test_the_app_id_is_relinks(self):
+        assert probe.RELINK_APP_ID == "1090670"
+
+
+class TestDoubleClickUsability:
+    """打包版双击运行时传不了参数，所有分叉都得能在程序里走完。"""
+
+    def _args(self, **kw):
+        import argparse
+        ns = argparse.Namespace(title="Granblue", gamepad_test=False)
+        for k, v in kw.items():
+            setattr(ns, k, v)
+        return ns
+
+    def test_source_run_never_prompts(self, monkeypatch):
+        """命令行运行必须保持非交互，否则脚本化调用会卡住。"""
+        monkeypatch.delattr(sys, "frozen", raising=False)
+        monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("不该提问"))
+        assert probe.ask_gamepad_test(self._args()) is False
+
+    def test_frozen_run_asks(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr(sys, "executable", str(tmp_path / "gbfr-probe.exe"))
+        probe.open_report()
+        monkeypatch.setattr("builtins.input", lambda *a: "y")
+        assert probe.ask_gamepad_test(self._args()) is True
+        assert "手柄测试: 要做" in (tmp_path / probe.REPORT_NAME).read_text(encoding="utf-8")
+
+    def test_declining_is_recorded(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr(sys, "executable", str(tmp_path / "gbfr-probe.exe"))
+        probe.open_report()
+        monkeypatch.setattr("builtins.input", lambda *a: "")
+        assert probe.ask_gamepad_test(self._args()) is False
+        assert "手柄测试: 跳过" in (tmp_path / probe.REPORT_NAME).read_text(encoding="utf-8")
+
+    def test_an_explicit_flag_is_not_re_asked(self, monkeypatch):
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("已经指定过了"))
+        assert probe.ask_gamepad_test(self._args(gamepad_test=True)) is False
+
+    def test_closed_stdin_does_not_crash(self, monkeypatch):
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        def no_stdin(*a):
+            raise EOFError
+        monkeypatch.setattr("builtins.input", no_stdin)
+        assert probe.ask_gamepad_test(self._args()) is False
