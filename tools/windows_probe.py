@@ -29,7 +29,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # 模块级导入而不是用到时再导：vigem 只依赖标准库，任何平台都能导入，放在函数里
 # 会让 PyInstaller 的静态分析更容易漏掉它。
-import vigem  # noqa: E402
+#
+# 但这里必须兜住 ImportError。模块级导入失败发生在 main() 存在之前，任何 try 都
+# 来不及 —— 打包漏了一个模块，用户看到的就是一屏 PyInstaller 的堆栈然后窗口关闭。
+# 真出这种事的时候，能出一份报告远比崩得干脆有用。
+try:
+    import vigem  # noqa: E402
+    _VIGEM_ERROR = None
+except BaseException as _e:  # noqa: BLE001 - 任何导入期故障都要活下来
+    vigem = None
+    _VIGEM_ERROR = f"{type(_e).__name__}: {_e}"
 
 DEFAULT_TITLE = "Granblue"
 REPORT_NAME = "gbfr-probe-report.txt"
@@ -167,8 +176,18 @@ def probe_imports():
     """
     section("0b. Imports")
     ok = True
-    for name in ("win32gui", "win32api", "win32con", "win32process",
-                 "PIL", "numpy", "cv2", "pyautogui"):
+    if _VIGEM_ERROR:
+        ok = False
+        say(f"  [FAIL] {'vigem':<14} {_VIGEM_ERROR}   <-- not bundled")
+    else:
+        say(f"  [ ok ] {'vigem':<14} {getattr(vigem, '__file__', '?')}")
+
+    # 只列这个探测器真正会用到的东西。列多了会误报：PyInstaller 不会打包没人
+    # import 的模块，于是一个用不上的名字就变成一条假的 [FAIL]。
+    # （win32process 就是这么被误列进来的 —— 只有 hook/injector.py 用它，
+    #   而探测器根本不碰注入那条路。）
+    for name in ("win32gui", "win32api", "win32con",
+                 "PIL", "numpy", "cv2", "pyautogui", "opencv", "window_capture"):
         try:
             module = __import__(name)
             where = getattr(module, "__file__", "(builtin)")
@@ -441,6 +460,12 @@ def probe_save():
 
 def probe_gamepad(do_test):
     section("5. Virtual gamepad  --  the plan for feature 4")
+
+    if vigem is None:
+        say(f"  The vigem module failed to import: {_VIGEM_ERROR}")
+        say("  >> This build is broken: the module was not bundled.")
+        say("     Everything above still stands; only this section is lost.")
+        return
 
     dll = vigem.client_dll_path()
     if not os.path.exists(dll):

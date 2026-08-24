@@ -339,3 +339,74 @@ class TestEmergencyDump:
         monkeypatch.setattr(sys, "executable", str(tmp_path / "gbfr-probe.exe"))
         path = probe.emergency_dump("崩溃了 → crash")
         assert path is not None and "crash" in open(path, encoding="ascii").read()
+
+
+class TestAMissingModuleMustNotKillTheProbe:
+    """真实故障：vigem 没被打进 exe，模块级 import 在 main() 存在之前就炸了，
+    用户看到一屏 PyInstaller 堆栈然后窗口关闭 —— 前面所有的兜底都够不着那里。
+    """
+
+    def test_the_import_is_guarded(self):
+        """模块级导入必须被 try 包住，否则打包漏了任何一个模块就是硬崩。"""
+        import ast
+        src = open(probe.__file__, encoding="utf-8").read()
+        tree = ast.parse(src)
+        guarded = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Try):
+                for stmt in node.body:
+                    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                        for alias in stmt.names:
+                            guarded.add(alias.name)
+        bare = set()
+        for node in tree.body:                       # 只看模块级
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    bare.add(alias.name)
+        assert "vigem" not in bare, "vigem 必须在 try 里导入"
+        assert "vigem" in guarded
+
+    def test_the_gamepad_section_degrades_instead_of_crashing(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delattr(sys, "frozen", raising=False)
+        monkeypatch.setattr(probe, "vigem", None)
+        monkeypatch.setattr(probe, "_VIGEM_ERROR", "ModuleNotFoundError: No module named 'vigem'")
+        path = probe.open_report()
+        probe.probe_gamepad(False)                   # 不抛
+        text = open(path, encoding="utf-8-sig").read()
+        assert "failed to import" in text
+        assert "Everything above still stands" in text
+
+    def test_a_missing_module_is_named_in_the_imports_section(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delattr(sys, "frozen", raising=False)
+        monkeypatch.setattr(probe, "_VIGEM_ERROR", "ModuleNotFoundError: No module named 'vigem'")
+        path = probe.open_report()
+        assert probe.probe_imports() is False
+        text = open(path, encoding="utf-8-sig").read()
+        assert "[FAIL]" in text and "vigem" in text
+        assert "not bundled" in text
+
+    def test_the_repo_root_modules_are_checked_too(self, tmp_path, monkeypatch):
+        """opencv / window_capture 也在仓库根，和 vigem 是同一个打包风险。"""
+        import inspect
+        src = inspect.getsource(probe.probe_imports)
+        assert "opencv" in src and "window_capture" in src
+
+
+def test_the_import_check_only_lists_what_the_probe_uses():
+    """列一个探测器不 import 的模块，PyInstaller 就不会打包它，于是变成假 [FAIL]。
+
+    win32process 正是这样进来的：只有 hook/injector.py 用它，而探测器不碰注入。
+    CI 的冒烟测试第一次跑就抓到了。
+    """
+    import inspect
+    src = inspect.getsource(probe)
+    checked = set()
+    import ast
+    for node in ast.walk(ast.parse(inspect.getsource(probe.probe_imports))):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if node.value.isidentifier():
+                checked.add(node.value)
+    for name in checked - {"vigem", "ok", "builtin"}:
+        assert name in src, f"{name} 在检查列表里，但探测器根本没引用它"
