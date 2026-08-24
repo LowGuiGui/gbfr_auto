@@ -118,7 +118,7 @@ class TestCrashesStillProduceAReport:
         status, text = self._run(tmp_path, monkeypatch, interrupted)
         assert status == 130
         assert "窗口那一段跑完了" in text
-        assert "已中断" in text
+        assert "Interrupted" in text
 
     def test_a_bare_systemexit_does_not_escape_silently(self, tmp_path, monkeypatch):
         """BaseException 而不是 Exception：SystemExit 也得留下痕迹。"""
@@ -133,7 +133,7 @@ class TestCrashesStillProduceAReport:
         status, text = self._run(tmp_path, monkeypatch, lambda args: probe.say("一切正常"))
         assert status == 0
         assert "一切正常" in text
-        assert "完成" in text
+        assert "Done" in text
 
 
 def test_non_windows_exits_cleanly(monkeypatch, capsys):
@@ -141,7 +141,7 @@ def test_non_windows_exits_cleanly(monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["gbfr-probe"])
     monkeypatch.delattr(sys, "frozen", raising=False)
     assert probe.main() == 1
-    assert "只能在 Windows" in capsys.readouterr().out
+    assert "only runs on Windows" in capsys.readouterr().out
 
 
 class TestSteamDiscovery:
@@ -168,13 +168,13 @@ class TestSteamDiscovery:
 
         roots = probe.steam_roots()
         assert roots[0][0] == os.path.normpath(r"D:\SteamLibrary\Steam")
-        assert "注册表" in roots[0][1]
+        assert "registry" in roots[0][1]
 
     def test_guesses_remain_as_fallback(self, monkeypatch):
         monkeypatch.setitem(sys.modules, "winreg", None)
         roots = probe.steam_roots()
         assert roots, "注册表读不到时仍要有兜底路径"
-        assert all(source == "常见路径" for _, source in roots)
+        assert all(source == "common path" for _, source in roots)
 
     def test_duplicates_are_collapsed(self, monkeypatch):
         import types
@@ -219,7 +219,7 @@ class TestDoubleClickUsability:
         probe.open_report()
         monkeypatch.setattr("builtins.input", lambda *a: "y")
         assert probe.ask_gamepad_test(self._args()) is True
-        assert "手柄测试: 要做" in (tmp_path / probe.REPORT_NAME).read_text(encoding="utf-8")
+        assert "gamepad test: yes" in (tmp_path / probe.REPORT_NAME).read_text(encoding="utf-8")
 
     def test_declining_is_recorded(self, monkeypatch, tmp_path):
         monkeypatch.setattr(sys, "frozen", True, raising=False)
@@ -227,7 +227,7 @@ class TestDoubleClickUsability:
         probe.open_report()
         monkeypatch.setattr("builtins.input", lambda *a: "")
         assert probe.ask_gamepad_test(self._args()) is False
-        assert "手柄测试: 跳过" in (tmp_path / probe.REPORT_NAME).read_text(encoding="utf-8")
+        assert "gamepad test: skipped" in (tmp_path / probe.REPORT_NAME).read_text(encoding="utf-8")
 
     def test_an_explicit_flag_is_not_re_asked(self, monkeypatch):
         monkeypatch.setattr(sys, "frozen", True, raising=False)
@@ -240,3 +240,102 @@ class TestDoubleClickUsability:
             raise EOFError
         monkeypatch.setattr("builtins.input", no_stdin)
         assert probe.ask_gamepad_test(self._args()) is False
+
+
+class TestEncodingCannotKillTheProbe:
+    """上一次的真实故障：英文版 Windows 控制台是 cp437/cp1252，print 一个中文字
+    就抛 UnicodeEncodeError；而报错处理器自己也打中文，于是报错时又炸一次，异常
+    逃出 except 和 finally，进程静默退出 —— "打了几行就没了，什么都没留下"。
+    """
+
+    def test_all_probe_output_is_ascii(self):
+        """永久性护栏：输出串一旦混进非 ASCII，这条就红。"""
+        import ast
+        src = open(probe.__file__, encoding="utf-8").read()
+        offenders = []
+        for node in ast.walk(ast.parse(src)):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+                continue
+            if node.func.id not in ("say", "print", "input"):
+                continue
+            for arg in node.args:
+                for sub in ast.walk(arg):
+                    if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                        if not sub.value.isascii():
+                            offenders.append(sub.value)
+        assert offenders == [], (
+            "探测器的输出必须是 ASCII —— 非英文 Windows 的控制台代码页编不了别的。"
+            f" 违规: {offenders[:3]}"
+        )
+
+    def test_say_survives_a_console_that_cannot_encode(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delattr(sys, "frozen", raising=False)
+        path = probe.open_report()
+
+        def hostile_print(*a, **k):
+            raise UnicodeEncodeError("charmap", "x", 0, 1, "no")
+
+        monkeypatch.setattr("builtins.print", hostile_print)
+        probe.say("this must still reach the file")      # 不抛
+        monkeypatch.undo()
+        assert "this must still reach the file" in open(path, encoding="utf-8-sig").read()
+
+    def test_the_file_is_written_before_the_console(self, tmp_path, monkeypatch):
+        """顺序是刻意的：文件永远写得进去，控制台才是会炸的那端。"""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delattr(sys, "frozen", raising=False)
+        path = probe.open_report()
+        seen = {}
+
+        def check_print(*a, **k):
+            seen["file_had_it"] = "ordering" in open(path, encoding="utf-8-sig").read()
+
+        monkeypatch.setattr("builtins.print", check_print)
+        probe.say("ordering")
+        monkeypatch.undo()
+        assert seen["file_had_it"], "print 之前就该落盘"
+
+    def test_a_crash_is_reported_even_when_the_console_is_hostile(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delattr(sys, "frozen", raising=False)
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(sys, "argv", ["gbfr-probe"])
+
+        def boom(args):
+            raise RuntimeError("underlying failure")
+
+        monkeypatch.setattr(probe, "run_all", boom)
+        real_print = print
+
+        def hostile_print(*a, **k):
+            raise UnicodeEncodeError("charmap", "x", 0, 1, "no")
+
+        monkeypatch.setattr("builtins.print", hostile_print)
+        status = probe.main()
+        monkeypatch.setattr("builtins.print", real_print)
+
+        assert status == 1
+        text = (tmp_path / probe.REPORT_NAME).read_text(encoding="utf-8-sig")
+        assert "RuntimeError: underlying failure" in text
+
+    def test_report_has_a_bom_so_notepad_renders_it(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delattr(sys, "frozen", raising=False)
+        path = probe.open_report()
+        probe.say("x")
+        probe._report.flush()
+        assert open(path, "rb").read(3) == b"\xef\xbb\xbf"
+
+
+class TestEmergencyDump:
+    def test_it_writes_when_the_report_could_not_be_opened(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "executable", str(tmp_path / "gbfr-probe.exe"))
+        path = probe.emergency_dump("Traceback...\nRuntimeError: early failure")
+        assert path is not None
+        assert "early failure" in open(path, encoding="ascii").read()
+
+    def test_non_ascii_does_not_defeat_it(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "executable", str(tmp_path / "gbfr-probe.exe"))
+        path = probe.emergency_dump("崩溃了 → crash")
+        assert path is not None and "crash" in open(path, encoding="ascii").read()
