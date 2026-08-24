@@ -18,9 +18,7 @@ import sys
 import time
 from datetime import datetime
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(_HERE))   # 仓库根：opencv / window_capture
-sys.path.insert(0, _HERE)                    # 同目录：vigem
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 OUT_DIR = os.path.join(os.getcwd(), "probe-out")
 DEFAULT_TITLE = "Granblue"
@@ -223,7 +221,7 @@ def probe_save():
 # 5. 虚拟手柄
 # --------------------------------------------------------------------------
 
-def probe_gamepad(do_test, do_install):
+def probe_gamepad(do_test):
     section("5. 虚拟手柄 —— 这是功能 4 的方案")
     import vigem
 
@@ -239,30 +237,16 @@ def probe_gamepad(do_test, do_install):
     elif installed:
         say(f"  ViGEmBus 驱动: 已安装 {version or '(版本未知)'}")
     else:
-        say("  ViGEmBus 驱动: 未安装")
+        say("  ViGEmBus 驱动: 未安装 —— 虚拟手柄要靠这个内核驱动。")
         say()
-        say("  这是个内核驱动，虚拟手柄要靠它。安装包已经内置在本程序里，")
-        say("  来自 vgamepad 的官方发布（MIT）。装它需要管理员权限，")
-        say("  会弹出微软的安装向导。")
+        say(f"  官方安装包（{vigem.DRIVER_VERSION}，签名的单个 exe，含 x64/x86/arm64）：")
+        say(f"      {vigem.DRIVER_DOWNLOAD_URL}")
         say()
-        if not do_install:
-            say("  要装的话，重新运行并加上 --install-driver：")
-            say("      gbfr-probe.exe --install-driver --gamepad-test")
-            return
-        say(f"  安装包: {vigem.installer_path()}")
-        answer = input("  现在启动安装程序？(yes/no) ").strip().lower()
-        if answer not in ("y", "yes", "是"):
-            say("  已取消，未做任何改动。")
-            return
-        ok, message = vigem.launch_installer()
-        say(f"  {message}")
-        if not ok:
-            return
-        installed, version = vigem.driver_installed()
-        say(f"  重新检测: {'已安装 ' + (version or '') if installed else '仍未检测到'}")
-        if not installed:
-            say("  >> 装完可能需要重启。重启后再跑一次本程序。")
-            return
+        say("  下载后双击安装，装完重启一次，再跑一遍本程序即可。同样不需要 Python。")
+        say()
+        say("  （本程序不内置这个安装包：内核驱动应该由用户自己从官方渠道装最新版，")
+        say("    而不是让一个第三方工具塞一个旧版本进系统。）")
+        return
 
     try:
         pad = vigem.VirtualGamepad()
@@ -309,8 +293,6 @@ def main():
     parser.add_argument("--title", default=DEFAULT_TITLE, help="游戏窗口标题关键字")
     parser.add_argument("--gamepad-test", action="store_true",
                         help="真的推一次摇杆（默认只检测能否创建虚拟手柄）")
-    parser.add_argument("--install-driver", action="store_true",
-                        help="缺 ViGEmBus 驱动时，启动内置的官方安装程序（会先问一遍）")
     args = parser.parse_args()
 
     if not sys.platform.startswith("win"):
@@ -329,7 +311,7 @@ def main():
         section("3. 截图后端")
         say("  跳过：没找到游戏窗口。")
     probe_save()
-    probe_gamepad(args.gamepad_test, args.install_driver)
+    probe_gamepad(args.gamepad_test)
 
     section("完成")
     os.makedirs(OUT_DIR, exist_ok=True)
