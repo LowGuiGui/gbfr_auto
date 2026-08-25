@@ -551,7 +551,8 @@ def probe_gamepad(do_test):
     # 支持的方式，不写卸载项）被判成"没装"，连试都没试。
     uninstall_entry, version = vigem.driver_installed()
     service = vigem.driver_service_present()
-    say(f"  uninstall entry : {uninstall_entry}  {version or ''}")
+    say(f"  uninstall entry : {uninstall_entry}  {version or ''}"
+        "   (both 32- and 64-bit registry views)")
     say(f"  driver service  : {service}   (HKLM\\SYSTEM\\...\\Services\\ViGEmBus)")
     say("  Neither is proof. Connecting is.")
     say()
@@ -562,6 +563,9 @@ def probe_gamepad(do_test):
     except BaseException as e:
         say(f"  Could not create the virtual gamepad: {e}")
         say()
+        # 只有两条线索都说"没有"，才敢让人去装。任何一条说"有"或"不知道"，
+        # 都可能是已经装好了 —— 这种情况下再跑一次 --create-device-node
+        # 会多出一个重复的设备节点，比什么都不做更糟。
         if service is False and uninstall_entry is False:
             say("  Both checks say the driver is absent, and connecting failed:")
             say("  the ViGEmBus driver is genuinely not installed.")
@@ -587,8 +591,14 @@ def probe_gamepad(do_test):
                 " --class-name System --class-guid 4D36E97D-E325-11CE-BFC1-08002BE10318")
             say("    nefconw.exe --install-driver --inf-path ViGEmBus.inf")
         else:
-            say("  A driver IS present but the connection failed -- likely a version")
-            say("  mismatch between the bundled client and the installed bus driver.")
+            say("  Something says a driver IS present, but connecting failed.")
+            say("  DO NOT run the manual install commands in this state -- a second")
+            say("  --create-device-node would add a duplicate device node.")
+            say()
+            say("  Check Device Manager -> System devices for")
+            say("  'Nefarius Virtual Gamepad Emulation Bus'. If it is there with a")
+            say("  warning icon, the driver is installed but not started: reboot, or")
+            say("  reinstall over the top with the official installer.")
         return
 
     try:
