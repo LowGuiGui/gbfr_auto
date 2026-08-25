@@ -467,6 +467,10 @@ class TestGamepadDetectionMustTryToConnect:
             "VirtualGamepad": FakePad,
             "DRIVER_VERSION": "1.22.0",
             "DRIVER_DOWNLOAD_URL": "https://example/installer.exe",
+            "RETRY_ATTEMPTS": 3,
+            "loaded_driver_path": staticmethod(lambda: r"C:\Windows\System32\drivers\ViGEmBus.sys"),
+            "bus_device_instances": staticmethod(lambda: ["ROOT&0000"]),
+            "other_vigem_users": staticmethod(lambda: []),
         })
         monkeypatch.setattr(probe, "vigem", fake)
         probe.probe_gamepad(False)
@@ -490,6 +494,10 @@ class TestGamepadDetectionMustTryToConnect:
             "VirtualGamepad": FakePad,
             "DRIVER_VERSION": "1.22.0",
             "DRIVER_DOWNLOAD_URL": "https://example/installer.exe",
+            "RETRY_ATTEMPTS": 3,
+            "loaded_driver_path": staticmethod(lambda: r"C:\Windows\System32\drivers\ViGEmBus.sys"),
+            "bus_device_instances": staticmethod(lambda: ["ROOT&0000"]),
+            "other_vigem_users": staticmethod(lambda: []),
         })
         monkeypatch.setattr(probe, "vigem", fake)
         probe.probe_gamepad(False)
@@ -524,6 +532,10 @@ class TestGamepadDetectionMustTryToConnect:
             "VirtualGamepad": FakePad,
             "DRIVER_VERSION": "1.22.0",
             "DRIVER_DOWNLOAD_URL": "https://example/installer.exe",
+            "RETRY_ATTEMPTS": 3,
+            "loaded_driver_path": staticmethod(lambda: r"C:\Windows\System32\drivers\ViGEmBus.sys"),
+            "bus_device_instances": staticmethod(lambda: ["ROOT&0000"]),
+            "other_vigem_users": staticmethod(lambda: []),
         })
         monkeypatch.setattr(probe, "vigem", fake)
         probe.probe_gamepad(False)

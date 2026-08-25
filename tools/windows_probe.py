@@ -506,22 +506,6 @@ def probe_save():
         say("  If you find a SaveData file anywhere, paste its full path back.")
         return
 
-    import struct
-    for path in found:
-        size = os.path.getsize(path)
-        mtime = datetime.fromtimestamp(os.path.getmtime(path))
-        say(f"  {path}")
-        say(f"    {size} bytes, last written {mtime:%Y-%m-%d %H:%M:%S}")
-        try:
-            with open(path, "rb") as f:
-                head = f.read(52)
-            if len(head) >= 12:
-                main_ver, steam_id = struct.unpack_from("<iQ", head, 0)
-                say(f"    main_version={main_ver}  steam_id={steam_id}")
-                say("    >> Header parses. This is a SaveGameFile container; readable.")
-        except OSError as e:
-            say(f"    could not read: {e}")
-
     say("  ** Run this again while farming and compare 'last written'. **")
     say("  Changes after each quest -> the panel can refresh per run (what we want).")
     say("  Changes only on exit     -> start/end comparison only.")
@@ -554,7 +538,35 @@ def probe_gamepad(do_test):
     say(f"  uninstall entry : {uninstall_entry}  {version or ''}"
         "   (both 32- and 64-bit registry views)")
     say(f"  driver service  : {service}   (HKLM\\SYSTEM\\...\\Services\\ViGEmBus)")
-    say("  Neither is proof. Connecting is.")
+    say(f"  driver binary   : {vigem.loaded_driver_path()}")
+
+    # 重复的总线设备是"插入音响了、一两秒后又拔出"最常见的原因
+    instances = vigem.bus_device_instances()
+    if instances is None:
+        say("  bus instances   : could not read the Enum registry")
+    else:
+        say(f"  bus instances   : {len(instances)}   {instances}")
+        if len(instances) > 1:
+            say("  >> MORE THAN ONE bus device. That is the classic symptom of two")
+            say("     ViGEmBus installations -- the client attaches to one while the")
+            say("     device enumerates on the other. Uninstall every ViGEmBus entry")
+            say("     from Apps & Features, reboot, then install 1.22.0 once.")
+
+    # Sunshine 等同样依赖 ViGEmBus 的软件常常自带一份驱动
+    others = vigem.other_vigem_users()
+    if others:
+        say("  other ViGEm users on this machine:")
+        for name, description, start in others:
+            mode = {2: "auto", 3: "manual", 4: "disabled"}.get(start, start)
+            say(f"    {name:<18} {description}   (start={mode})")
+        say("  >> These install their own ViGEmBus. Two installs is the usual cause")
+        say("     of the failure below. Try stopping the service and retrying:")
+        say(f"       net stop {others[0][0]}      (admin, reversible: net start ...)")
+    else:
+        say("  other ViGEm users: none detected")
+
+    say()
+    say("  None of the above is proof. Connecting is.")
     say()
 
     pad = vigem.VirtualGamepad()
@@ -562,6 +574,12 @@ def probe_gamepad(do_test):
         pad.connect()
     except BaseException as e:
         say(f"  Could not create the virtual gamepad: {e}")
+        say()
+        say("  What that sequence means: vigem_target_add first plugs the device in")
+        say("  (Windows plays the connect chime), then waits for it to become ready.")
+        say("  When that wait fails the client unplugs it again (disconnect chime)")
+        say("  and returns the REMOVAL's error -- which is why the code says")
+        say("  TARGET_NOT_PLUGGED_IN even though plugging in is the part that worked.")
         say()
         # 只有两条线索都说"没有"，才敢让人去装。任何一条说"有"或"不知道"，
         # 都可能是已经装好了 —— 这种情况下再跑一次 --create-device-node
@@ -602,7 +620,8 @@ def probe_gamepad(do_test):
         return
 
     try:
-        say("  >> Virtual Xbox 360 pad created; Windows sees it.")
+        say(f"  >> Virtual Xbox 360 pad created (attempt {pad.attempts_used}"
+            f" of {vigem.RETRY_ATTEMPTS}); Windows sees it.")
         say("     It goes through XInput device state, not window messages, so it")
         say("     needs no focus and never touches your mouse or keyboard.")
 
