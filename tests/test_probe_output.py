@@ -494,9 +494,17 @@ class TestGamepadDetectionMustTryToConnect:
         monkeypatch.setattr(probe, "vigem", fake)
         probe.probe_gamepad(False)
         text = open(path, encoding="utf-8-sig").read()
-        assert "Extracting the installer is NOT installing it" in text
-        assert "--create-device-node" in text
+        # 主路径必须是官方安装程序；nefconw 只是安装程序跑不了时的兜底。
+        assert "Do NOT pass /extract" in text
+        assert "EXTRACTED payload, not an install" in text
+        installer_at = text.index("Double-click it and let it install")
+        nefcon_at = text.index("--create-device-node")
+        assert installer_at < nefcon_at, "先给安装程序，再给手动命令"
+        assert "Only if the installer refuses" in text
         assert "--install-driver" in text
+        # 数值来自 ViGEmBus 自己的 INF，核对过
+        assert r"Nefarius\ViGEmBus\Gen1" in text
+        assert "4D36E97D-E325-11CE-BFC1-08002BE10318" in text
 
     def test_a_present_service_points_at_version_mismatch_instead(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
