@@ -506,7 +506,7 @@ class TestGamepadDetectionMustTryToConnect:
         assert r"Nefarius\ViGEmBus\Gen1" in text
         assert "4D36E97D-E325-11CE-BFC1-08002BE10318" in text
 
-    def test_a_present_service_points_at_version_mismatch_instead(self, tmp_path, monkeypatch):
+    def test_a_present_service_warns_against_installing_again(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         monkeypatch.delattr(sys, "frozen", raising=False)
         path = probe.open_report()
@@ -527,4 +527,12 @@ class TestGamepadDetectionMustTryToConnect:
         })
         monkeypatch.setattr(probe, "vigem", fake)
         probe.probe_gamepad(False)
-        assert "version" in open(path, encoding="utf-8-sig").read()
+        text = open(path, encoding="utf-8-sig").read()
+        # 可能已经装好了。这时再跑一次 --create-device-node 会多一个重复设备节点。
+        assert "DO NOT run the manual install commands" in text
+        assert "duplicate device node" in text
+        # 警告里提到命令名是可以的（那是在解释为什么别跑）；不能出现的是
+        # 那段"照着敲"的安装指引本身。
+        assert "Only if the installer refuses" not in text
+        assert "Download " not in text
+        assert "Device Manager" in text
