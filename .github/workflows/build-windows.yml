@@ -197,7 +197,7 @@ jobs:
         run: |
           $warn = "build/gbfr-probe/warn-gbfr-probe.txt"
           if (-not (Test-Path $warn)) { throw "no PyInstaller warning file at $warn" }
-          $ours = 'vigem', 'xinput', 'procinfo', 'opencv', 'window_capture', 'applog', 'config'
+          $ours = 'vigem', 'xinput', 'procinfo', 'framediff', 'geometry', 'opencv', 'window_capture', 'applog', 'config'
           $bad = Get-Content $warn | Where-Object {
             $line = $_
             ($line -match '^missing module named ([A-Za-z_][A-Za-z0-9_]*)') -and
