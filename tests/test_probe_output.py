@@ -785,3 +785,131 @@ class TestXInputFocusSection:
             _x.Sample(1, False, _x.Reading(2, 0, 0, 0, 0, 0, 0, 0), False)])
         probe.probe_xinput_focus(True)
         capsys.readouterr().out.encode("ascii")
+
+
+def _stats(mean, count=15):
+    return {"count": count, "mean": mean, "max": mean, "median": mean, "dropped": 0}
+
+
+class TestFocusBehaviourSection:
+    """第 8 段要区分"游戏停了"和"游戏在跑但不理输入"。判错方向比没测更糟。"""
+
+    @pytest.fixture(autouse=True)
+    def _no_waiting(self, monkeypatch):
+        """倒计时有两次 5 秒，测试里一秒都不能真睡。"""
+        monkeypatch.setattr(probe.time, "sleep", lambda _s: None)
+
+    def test_no_window_is_skipped(self, capsys):
+        probe.probe_focus_behaviour(True, None)
+        assert "game window was not found" in capsys.readouterr().out
+
+    def test_without_the_flag_it_only_explains_itself(self, capsys):
+        probe.probe_focus_behaviour(False, 1234)
+        out = capsys.readouterr().out
+        assert "--focus-test" in out
+        assert "IN A QUEST" in out
+
+    def _arm(self, monkeypatch, phases, focus_sequence):
+        pad = _FakePad()
+        monkeypatch.setattr("builtins.input", lambda *a: "")
+        monkeypatch.setattr(probe.vigem, "VirtualGamepad", lambda: pad)
+        states = iter(focus_sequence)
+        monkeypatch.setattr(probe, "_game_is_focused", lambda hwnd: next(states))
+        results = iter(phases)
+        monkeypatch.setattr(probe, "_capture_deltas",
+                            lambda hwnd, **kw: (next(results), 0))
+        return pad
+
+    def test_frozen_game_is_named_and_input_is_left_moot(self, capsys, monkeypatch):
+        """1.1 的防挂机暂停应该长这样：失焦后画面完全不动。"""
+        pad = self._arm(monkeypatch,
+                        [_stats(20.0), _stats(0.05), _stats(0.05)],
+                        [True, False])
+        probe.probe_focus_behaviour(True, 1234)
+        out = capsys.readouterr().out
+        assert "motion verdict: [frozen]" in out
+        assert "input verdict : [moot]" in out
+        assert pad.closed
+
+    def test_running_but_ignoring_input(self, capsys, monkeypatch):
+        pad = self._arm(monkeypatch,
+                        [_stats(20.0), _stats(19.0), _stats(19.2)],
+                        [True, False])
+        probe.probe_focus_behaviour(True, 1234)
+        out = capsys.readouterr().out
+        assert "motion verdict: [running]" in out
+        assert "input verdict : [ignored]" in out
+        assert pad.closed
+
+    def test_input_getting_through_is_reported(self, capsys, monkeypatch):
+        self._arm(monkeypatch,
+                  [_stats(20.0), _stats(18.0), _stats(40.0)],
+                  [True, False])
+        probe.probe_focus_behaviour(True, 1234)
+        assert "input verdict : [reaching]" in capsys.readouterr().out
+
+    def test_stops_if_the_game_is_not_in_front_for_the_baseline(self, capsys, monkeypatch):
+        """基准段测错了，后面两段就毫无意义 —— 不如当场停下。"""
+        self._arm(monkeypatch, [_stats(20.0)], [False])
+        probe.probe_focus_behaviour(True, 1234)
+        out = capsys.readouterr().out
+        assert "NOT in front" in out
+        assert "motion verdict" not in out
+
+    def test_stops_if_the_user_never_clicked_away(self, capsys, monkeypatch):
+        self._arm(monkeypatch, [_stats(20.0)], [True, True])
+        probe.probe_focus_behaviour(True, 1234)
+        out = capsys.readouterr().out
+        assert "still in front" in out
+        assert "motion verdict" not in out
+
+    def test_unknown_focus_does_not_block_the_run(self, capsys, monkeypatch):
+        """拿不到前台信息时不该硬停 —— 只有明确的 False/True 才是错。"""
+        self._arm(monkeypatch,
+                  [_stats(20.0), _stats(0.05), _stats(0.05)],
+                  [None, None])
+        probe.probe_focus_behaviour(True, 1234)
+        assert "motion verdict" in capsys.readouterr().out
+
+    def test_motion_verdict_survives_a_missing_gamepad(self, capsys, monkeypatch):
+        """手柄坏了只该丢掉输入那一半，动静那一半照样成立。"""
+        monkeypatch.setattr("builtins.input", lambda *a: "")
+        states = iter([True, False])
+        monkeypatch.setattr(probe, "_game_is_focused", lambda hwnd: next(states))
+        results = iter([_stats(20.0), _stats(0.05)])
+        monkeypatch.setattr(probe, "_capture_deltas",
+                            lambda hwnd, **kw: (next(results), 0))
+        monkeypatch.setattr(probe, "vigem", None)
+
+        probe.probe_focus_behaviour(True, 1234)
+        out = capsys.readouterr().out
+        assert "Phase 3 skipped" in out
+        assert "motion verdict: [frozen]" in out
+        assert "input verdict" not in out
+
+    def test_pad_is_unplugged_even_if_phase_three_explodes(self, capsys, monkeypatch):
+        pad = _FakePad()
+        monkeypatch.setattr("builtins.input", lambda *a: "")
+        monkeypatch.setattr(probe.vigem, "VirtualGamepad", lambda: pad)
+        states = iter([True, False])
+        monkeypatch.setattr(probe, "_game_is_focused", lambda hwnd: next(states))
+
+        calls = {"n": 0}
+
+        def capture(hwnd, **kw):
+            calls["n"] += 1
+            if calls["n"] >= 3:
+                raise RuntimeError("capture died")
+            return (_stats(20.0), 0)
+
+        monkeypatch.setattr(probe, "_capture_deltas", capture)
+        with pytest.raises(RuntimeError):
+            probe.probe_focus_behaviour(True, 1234)
+        assert pad.closed, "摇杆推着的虚拟手柄绝不能留在系统里"
+
+    def test_section_output_is_ascii(self, capsys, monkeypatch):
+        self._arm(monkeypatch,
+                  [_stats(20.0), _stats(6.0), _stats(30.0)],
+                  [True, False])
+        probe.probe_focus_behaviour(True, 1234)
+        capsys.readouterr().out.encode("ascii")

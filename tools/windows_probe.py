@@ -52,6 +52,13 @@ except BaseException as _e:  # noqa: BLE001 - 同上，打包漏了也要出报�
     xinput = None
     _INPUT_SCAN_ERROR = f"{type(_e).__name__}: {_e}"
 
+try:
+    import framediff  # noqa: E402
+    _FRAMEDIFF_ERROR = None
+except BaseException as _e:  # noqa: BLE001 - numpy 没打进去也要出报告
+    framediff = None
+    _FRAMEDIFF_ERROR = f"{type(_e).__name__}: {_e}"
+
 DEFAULT_TITLE = "Granblue"
 REPORT_NAME = "gbfr-probe-report.txt"
 CAPTURE_NAME = "gbfr-probe-capture.png"
@@ -865,6 +872,175 @@ def probe_xinput_focus(do_test):
 
 
 # ---------------------------------------------------------------------------
+# 8. 失焦以后：停了，还是只是不理输入
+# ---------------------------------------------------------------------------
+
+PHASE_FRAMES = 16
+PHASE_INTERVAL = 0.2
+
+
+def _capture_deltas(hwnd, frames=PHASE_FRAMES, interval=PHASE_INTERVAL):
+    """连续截图，返回相邻帧差分的统计量和截图失败的次数。"""
+    from window_capture import _capture_printwindow
+
+    deltas = []
+    failures = 0
+    previous = None
+    for _ in range(frames):
+        try:
+            img = _capture_printwindow(hwnd)
+        except BaseException:  # noqa: BLE001 - 截图失败不该让整段测试消失
+            img = None
+        if img is None:
+            failures += 1
+        else:
+            if previous is not None:
+                deltas.append(framediff.frame_delta(previous, img))
+            previous = img
+        time.sleep(interval)
+    return framediff.summarize(deltas), failures
+
+
+def _report_phase(label, stats, failures):
+    say(f"  {label:<28} frames={stats['count']:<3} "
+        f"mean={stats['mean']:7.3f}  max={stats['max']:7.3f}")
+    if failures:
+        say(f"  {'':28} ({failures} capture(s) failed)")
+    if stats["dropped"]:
+        say(f"  {'':28} ({stats['dropped']} frame(s) dropped -- window resized?)")
+
+
+def _game_is_focused(hwnd):
+    """游戏窗口是不是前台。拿不到返回 None。"""
+    front = xinput.foreground_window() if xinput else None
+    if front is None:
+        return None
+    return int(front) == int(hwnd)
+
+
+def probe_focus_behaviour(do_test, hwnd):
+    section("8. Focus behaviour  --  frozen, or just ignoring input?")
+
+    if framediff is None:
+        say(f"  The framediff module failed to import: {_FRAMEDIFF_ERROR}")
+        say("  >> This build is broken: the module (or numpy) was not bundled.")
+        return
+
+    say("  Section 5 asks 'did the character move?' and a human answers it. That")
+    say("  cannot tell these two apart, and they need completely different fixes:")
+    say()
+    say("    the whole game is PAUSED   -> the 1.1 anti-AFK pause. Nothing about")
+    say("                                  input delivery would help.")
+    say("    running but IGNORING input -> an input-delivery problem, which is")
+    say("                                  what #45 has been assuming all along.")
+    say()
+    say("  This measures it by diffing captured frames instead of guessing.")
+    say()
+
+    if not hwnd:
+        say("  Skipped: the game window was not found, so there is nothing to watch.")
+        return
+    if not do_test:
+        say("  Pass --focus-test to run it. Needs ~30 seconds and two clicks,")
+        say("  and the game must be IN A QUEST with something moving on screen.")
+        return
+
+    say("  IMPORTANT: be in a quest with visible motion. Run this on a menu or a")
+    say("  still screen and there is no signal to measure -- the test will say so")
+    say("  rather than invent an answer, but you will have wasted the run.")
+    say()
+    say("  Three phases, about 3 seconds each:")
+    say("    1. game focused, no input     <- the baseline")
+    say("    2. game NOT focused, no input <- did it stop?")
+    say("    3. game NOT focused, stick held forward")
+    say()
+    try:
+        input("  Click the GAME so it is in front, then press Enter here... ")
+    except (EOFError, KeyboardInterrupt):
+        say("  Skipped.")
+        return
+
+    # Enter 是在探测器窗口里按的，所以此刻前台多半是探测器而不是游戏。
+    # 给一点时间让用户点回游戏，再开始量。
+    say()
+    say("  Starting in 5 seconds -- click the GAME window now.")
+    for i in range(5, 0, -1):
+        print(f"    ...{i}", end="\r", flush=True)
+        time.sleep(1)
+    print("         ", end="\r")
+
+    focused = _game_is_focused(hwnd)
+    if focused is False:
+        say("  >> The game is NOT in front. Phase 1 would measure the wrong thing.")
+        say("     Stopping here rather than producing a misleading baseline.")
+        return
+    say("  Phase 1: game focused, no input")
+    phase1, fail1 = _capture_deltas(hwnd)
+    _report_phase("focused + idle", phase1, fail1)
+
+    say()
+    say("  Now click ANY OTHER window and leave it in front. 5 seconds.")
+    for i in range(5, 0, -1):
+        print(f"    ...{i}", end="\r", flush=True)
+        time.sleep(1)
+    print("         ", end="\r")
+
+    if _game_is_focused(hwnd) is True:
+        say("  >> The game is still in front. Phases 2 and 3 need it unfocused.")
+        say("     Stopping here rather than reporting a comparison that is not one.")
+        return
+    say("  Phase 2: game unfocused, no input")
+    phase2, fail2 = _capture_deltas(hwnd)
+    _report_phase("unfocused + idle", phase2, fail2)
+
+    phase3, fail3 = None, 0
+    if vigem is None:
+        say()
+        say(f"  Phase 3 skipped: the vigem module failed to import ({_VIGEM_ERROR}).")
+        say("  The motion verdict below still stands; only the input half is lost.")
+    else:
+        pad = vigem.VirtualGamepad()
+        try:
+            pad.connect()
+        except BaseException as e:
+            say()
+            say(f"  Phase 3 skipped: could not create the virtual gamepad ({e}).")
+            say("  Section 5 explains what to do about that. The motion verdict")
+            say("  below still stands.")
+            pad = None
+        if pad is not None:
+            try:
+                say()
+                say("  Phase 3: game unfocused, holding the stick forward")
+                pad.left_stick_forward()
+                phase3, fail3 = _capture_deltas(hwnd)
+            finally:
+                try:
+                    pad.neutral()
+                finally:
+                    pad.close()
+            _report_phase("unfocused + stick held", phase3, fail3)
+
+    say()
+    motion_code, motion_text = framediff.motion_verdict(phase1, phase2)
+    say(f"  motion verdict: [{motion_code}]")
+    for line in wrap(motion_text):
+        say(f"    {line}")
+
+    if phase3 is not None:
+        say()
+        input_code, input_text = framediff.input_verdict(phase2, phase3, motion_code)
+        say(f"  input verdict : [{input_code}]")
+        for line in wrap(input_text):
+            say(f"    {line}")
+
+    say()
+    say("  Thresholds in framediff.py are estimates until real numbers come back.")
+    say("  The raw means above are the measurement; the verdicts are a reading of")
+    say("  them. If the two disagree, trust the numbers and say so.")
+
+
+# ---------------------------------------------------------------------------
 
 def run_all(args):
     """跑完所有探测。任何一段抛出的异常由 main() 兜住并写进报告。"""
@@ -892,6 +1068,7 @@ def run_all(args):
     probe_gamepad(args.gamepad_test or ask_gamepad_test(args), hwnd)
     probe_input_backend(hwnd)
     probe_xinput_focus(args.xinput_test or ask_xinput_test(args))
+    probe_focus_behaviour(args.focus_test, hwnd)
 
 
 def ask_gamepad_test(args):
@@ -968,6 +1145,8 @@ def main():
                         help="actually push the stick (default: only check the pad can be made)")
     parser.add_argument("--xinput-test", action="store_true",
                         help="measure whether Windows zeroes XInput while unfocused (#45)")
+    parser.add_argument("--focus-test", action="store_true",
+                        help="measure whether the game freezes or just ignores input (#45)")
     args = parser.parse_args()
 
     if not sys.platform.startswith("win"):
