@@ -405,31 +405,105 @@ def steam_roots():
     return unique
 
 
-def probe_save():
-    section("4. Save file  --  the key question for feature 3B")
+def save_locations():
+    """所有可能放存档的地方，按可信度排序。
 
-    found = []
+    第一版只找了 Steam userdata/<id>/1090670/remote，结果在真机上一个都没找到。
+    游戏真正写盘的位置是 %LOCALAPPDATA%\\GBFR\\Saved\\SaveGames —— Steam 云那
+    几份是同步出来的副本。对功能 3B 来说本地那份才是关键：它的 mtime 才是"每打完
+    一关有没有落盘"的真实信号。
+    """
+    places = []
+    local = os.path.expandvars(r"%LOCALAPPDATA%\GBFR\Saved\SaveGames")
+    places.append((local, "local save (this is where the game writes)"))
+
     for root, source in steam_roots():
         userdata = os.path.join(root, "userdata")
         if not os.path.isdir(userdata):
             continue
-        say(f"  Steam at {root}   (found via {source})")
-        for steam_id in os.listdir(userdata):
-            remote = os.path.join(userdata, steam_id, RELINK_APP_ID, "remote")
-            if not os.path.isdir(remote):
-                continue
-            for name in os.listdir(remote):
-                found.append(os.path.join(remote, name))
+        try:
+            account_ids = os.listdir(userdata)
+        except OSError:
+            continue
+        for account in account_ids:
+            places.append((
+                os.path.join(userdata, account, "881020", "ac",
+                             "WinAppDataLocal", "GBFR", "Saved", "SaveGames"),
+                f"Steam cloud mirror ({source})",
+            ))
+            places.append((
+                os.path.join(userdata, account, RELINK_APP_ID, "remote"),
+                f"Steam cloud remote ({source})",
+            ))
+    return places
+
+
+def describe_save(path):
+    import struct
+    size = os.path.getsize(path)
+    mtime = datetime.fromtimestamp(os.path.getmtime(path))
+    say(f"    {os.path.basename(path)}   {size} bytes   last written {mtime:%Y-%m-%d %H:%M:%S}")
+    try:
+        with open(path, "rb") as f:
+            head = f.read(52)
+    except OSError as e:
+        say(f"      could not read: {e}")
+        return
+    if len(head) >= 12:
+        main_ver, steam_id = struct.unpack_from("<iQ", head, 0)
+        # 合理性检查：SteamID64 都是 7656119... 开头
+        plausible = 76561197960265728 <= steam_id <= 76561202255233023
+        say(f"      main_version={main_ver}  steam_id={steam_id}"
+            f"  {'(SaveGameFile header, readable)' if plausible else '(header looks unusual)'}")
+
+
+def probe_save():
+    section("4. Save file  --  the key question for feature 3B")
+
+    found = []
+    for path, source in save_locations():
+        if not os.path.isdir(path):
+            continue
+        try:
+            names = sorted(os.listdir(path))
+        except OSError as e:
+            say(f"  [{path}] could not list: {e}")
+            continue
+        if not names:
+            continue
+        say(f"  {path}   ({source})")
+        for name in names:
+            full = os.path.join(path, name)
+            if os.path.isfile(full):
+                found.append(full)
+                describe_save(full)
+        say()
 
     if not found:
         say("  No save found. Locations checked:")
-        for root, source in steam_roots():
-            userdata = os.path.join(root, "userdata")
-            mark = "exists" if os.path.isdir(userdata) else "  --  "
-            say(f"    [{mark}] {userdata}   ({source})")
+        for path, source in save_locations():
+            mark = "exists" if os.path.isdir(path) else "  --  "
+            say(f"    [{mark}] {path}   ({source})")
         say()
-        say(f"  Look for: <Steam>\\userdata\\<SteamID>\\{RELINK_APP_ID}\\remote\\")
-        say("  If you find it, paste the full path back.")
+        # 硬编码 AppID 猜错过一次，所以这里干脆把实际存在的都列出来
+        say("  Every app id present under Steam userdata (so we stop guessing):")
+        for root, _source in steam_roots():
+            userdata = os.path.join(root, "userdata")
+            if not os.path.isdir(userdata):
+                continue
+            try:
+                for account in sorted(os.listdir(userdata)):
+                    account_dir = os.path.join(userdata, account)
+                    if not os.path.isdir(account_dir):
+                        continue
+                    ids = sorted(x for x in os.listdir(account_dir)
+                                 if os.path.isdir(os.path.join(account_dir, x)))
+                    say(f"    {account_dir}")
+                    say(f"      {', '.join(ids) if ids else '(empty)'}")
+            except OSError as e:
+                say(f"    could not list {userdata}: {e}")
+        say()
+        say("  If you find a SaveData file anywhere, paste its full path back.")
         return
 
     import struct
@@ -448,7 +522,6 @@ def probe_save():
         except OSError as e:
             say(f"    could not read: {e}")
 
-    say()
     say("  ** Run this again while farming and compare 'last written'. **")
     say("  Changes after each quest -> the panel can refresh per run (what we want).")
     say("  Changes only on exit     -> start/end comparison only.")
@@ -473,28 +546,41 @@ def probe_gamepad(do_test):
         say("  >> This build has no gamepad support. Use a CI artifact.")
         return
 
-    installed, version = vigem.driver_installed()
-    if installed is None:
-        say("  Could not query the registry; trying to connect anyway.")
-    elif installed:
-        say(f"  ViGEmBus driver: installed {version or '(version unknown)'}")
-    else:
-        say("  ViGEmBus driver: NOT installed -- the virtual gamepad needs it.")
-        say()
-        say(f"  Official installer ({vigem.DRIVER_VERSION}, one signed exe, x64/x86/arm64):")
-        say(f"      {vigem.DRIVER_DOWNLOAD_URL}")
-        say()
-        say("  Download it, run it, reboot, then run this probe again.")
-        say("  (We deliberately do not bundle it: a kernel driver should come from")
-        say("   the vendor at its current version, not from a third-party tool.)")
-        return
+    # 两条线索先记下来，但都不作数 —— 唯一算数的是能不能真的连上。
+    # 第一版在卸载项里没找到就直接 return，于是用 nefconw 手动装的驱动（官方
+    # 支持的方式，不写卸载项）被判成"没装"，连试都没试。
+    uninstall_entry, version = vigem.driver_installed()
+    service = vigem.driver_service_present()
+    say(f"  uninstall entry : {uninstall_entry}  {version or ''}")
+    say(f"  driver service  : {service}   (HKLM\\SYSTEM\\...\\Services\\ViGEmBus)")
+    say("  Neither is proof. Connecting is.")
+    say()
 
+    pad = vigem.VirtualGamepad()
     try:
-        pad = vigem.VirtualGamepad()
         pad.connect()
     except BaseException as e:
         say(f"  Could not create the virtual gamepad: {e}")
-        say("  >> Driver not working, or a version mismatch.")
+        say()
+        if service is False and uninstall_entry is False:
+            say("  Both checks say the driver is absent, and connecting failed:")
+            say("  the ViGEmBus driver is genuinely not installed.")
+            say()
+            say("  Extracting the installer is NOT installing it. If you have a")
+            say("  folder with ViGEmBus.inf / ViGEmBus.sys / nefconw.exe, that is")
+            say("  the extracted payload -- double-clicking nefconw.exe does nothing")
+            say("  because it is a command line tool. From an ADMIN prompt, in that")
+            say("  folder, run both of these:")
+            say()
+            say("    nefconw.exe --create-device-node --hardware-id Nefarius\\ViGEmBus\\Gen1"
+                " --class-name System --class-guid 4D36E97D-E325-11CE-BFC1-08002BE10318")
+            say("    nefconw.exe --install-driver --inf-path \"ViGEmBus.inf\"")
+            say()
+            say("  Or just run the official installer, which does it for you:")
+            say(f"      {vigem.DRIVER_DOWNLOAD_URL}")
+        else:
+            say("  A driver IS present but the connection failed -- likely a version")
+            say("  mismatch between the bundled client and the installed bus driver.")
         return
 
     try:

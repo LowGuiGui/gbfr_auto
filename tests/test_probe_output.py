@@ -410,3 +410,113 @@ def test_the_import_check_only_lists_what_the_probe_uses():
                 checked.add(node.value)
     for name in checked - {"vigem", "ok", "builtin"}:
         assert name in src, f"{name} 在检查列表里，但探测器根本没引用它"
+
+
+class TestSaveDiscovery:
+    """第一版只找 Steam userdata/<id>/1090670/remote，真机上一个都没找到。
+
+    游戏真正写盘的地方是 %LOCALAPPDATA%\\GBFR\\Saved\\SaveGames；Steam 云那几份
+    是同步副本。对功能 3B 来说本地那份才关键 —— 它的 mtime 才是真实信号。
+    """
+
+    def test_the_local_appdata_path_is_checked_first(self, monkeypatch):
+        monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\x\AppData\Local")
+        first_path, first_source = probe.save_locations()[0]
+        # 不用 os.path.join 断言：%VAR% 只有 ntpath.expandvars 会展开，Linux 上
+        # 这条路径保持原样，分隔符也是反斜杠。看组成部分就够了。
+        assert first_path.endswith("GBFR" + "\\" + "Saved" + "\\" + "SaveGames")
+        assert "where the game writes" in first_source
+
+    def test_steam_cloud_mirrors_are_also_checked(self, monkeypatch, tmp_path):
+        userdata = tmp_path / "userdata" / "12345678"
+        userdata.mkdir(parents=True)
+        monkeypatch.setattr(probe, "steam_roots", lambda: [(str(tmp_path), "test")])
+        paths = [p for p, _ in probe.save_locations()]
+        assert any("881020" in p for p in paths), "云端镜像路径也要查"
+        assert any(probe.RELINK_APP_ID in p for p in paths)
+
+    def test_a_missing_localappdata_does_not_explode(self, monkeypatch):
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+        monkeypatch.setattr(probe, "steam_roots", lambda: [])
+        assert probe.save_locations()          # 仍返回一条（未展开的）路径，不抛
+
+
+class TestGamepadDetectionMustTryToConnect:
+    """卸载项只有 MSI 安装才会写。用 nefconw 手动装（官方支持）不写，于是驱动
+    装好了却被判成没装 —— 而第一版在那种情况下连试都不试就 return 了。
+    """
+
+    def test_a_missing_uninstall_entry_does_not_skip_the_attempt(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delattr(sys, "frozen", raising=False)
+        probe.open_report()
+
+        attempted = []
+
+        class FakePad:
+            def connect(self):
+                attempted.append(True)
+                raise RuntimeError("bus not found")
+            def close(self):
+                pass
+
+        fake = type("V", (), {
+            "client_dll_path": staticmethod(lambda: __file__),   # 存在即可
+            "driver_installed": staticmethod(lambda: (False, None)),
+            "driver_service_present": staticmethod(lambda: False),
+            "VirtualGamepad": FakePad,
+            "DRIVER_VERSION": "1.22.0",
+            "DRIVER_DOWNLOAD_URL": "https://example/installer.exe",
+        })
+        monkeypatch.setattr(probe, "vigem", fake)
+        probe.probe_gamepad(False)
+        assert attempted, "注册表说没装也必须真的试一次连接"
+
+    def test_the_report_explains_extract_is_not_install(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delattr(sys, "frozen", raising=False)
+        path = probe.open_report()
+
+        class FakePad:
+            def connect(self):
+                raise RuntimeError("bus not found")
+            def close(self):
+                pass
+
+        fake = type("V", (), {
+            "client_dll_path": staticmethod(lambda: __file__),
+            "driver_installed": staticmethod(lambda: (False, None)),
+            "driver_service_present": staticmethod(lambda: False),
+            "VirtualGamepad": FakePad,
+            "DRIVER_VERSION": "1.22.0",
+            "DRIVER_DOWNLOAD_URL": "https://example/installer.exe",
+        })
+        monkeypatch.setattr(probe, "vigem", fake)
+        probe.probe_gamepad(False)
+        text = open(path, encoding="utf-8-sig").read()
+        assert "Extracting the installer is NOT installing it" in text
+        assert "--create-device-node" in text
+        assert "--install-driver" in text
+
+    def test_a_present_service_points_at_version_mismatch_instead(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delattr(sys, "frozen", raising=False)
+        path = probe.open_report()
+
+        class FakePad:
+            def connect(self):
+                raise RuntimeError("connect failed")
+            def close(self):
+                pass
+
+        fake = type("V", (), {
+            "client_dll_path": staticmethod(lambda: __file__),
+            "driver_installed": staticmethod(lambda: (False, None)),
+            "driver_service_present": staticmethod(lambda: True),
+            "VirtualGamepad": FakePad,
+            "DRIVER_VERSION": "1.22.0",
+            "DRIVER_DOWNLOAD_URL": "https://example/installer.exe",
+        })
+        monkeypatch.setattr(probe, "vigem", fake)
+        probe.probe_gamepad(False)
+        assert "version" in open(path, encoding="utf-8-sig").read()
