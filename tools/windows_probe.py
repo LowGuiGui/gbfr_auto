@@ -515,7 +515,24 @@ def probe_save():
 # 5. 虚拟手柄
 # ---------------------------------------------------------------------------
 
-def probe_gamepad(do_test):
+def window_mode_label(hwnd):
+    """把窗口模式说成人话 —— 手柄测试的结论完全取决于它。"""
+    if not hwnd:
+        return "unknown (no game window found)"
+    try:
+        import win32api
+        import win32gui
+        style = win32api.GetWindowLong(hwnd, GWL_STYLE)
+        rect = win32gui.GetWindowRect(hwnd)
+    except Exception:
+        return "unknown (could not read the window)"
+    if style & WS_CAPTION:
+        return "ordinary WINDOWED (has a title bar)"
+    size = (rect[2] - rect[0], rect[3] - rect[1])
+    return f"borderless / Full Screen Window ({size[0]}x{size[1]})"
+
+
+def probe_gamepad(do_test, hwnd=None):
     section("5. Virtual gamepad  --  the plan for feature 4")
 
     if vigem is None:
@@ -559,9 +576,6 @@ def probe_gamepad(do_test):
         for name, description, start in others:
             mode = {2: "auto", 3: "manual", 4: "disabled"}.get(start, start)
             say(f"    {name:<18} {description}   (start={mode})")
-        say("  >> These install their own ViGEmBus. Two installs is the usual cause")
-        say("     of the failure below. Try stopping the service and retrying:")
-        say(f"       net stop {others[0][0]}      (admin, reversible: net start ...)")
     else:
         say("  other ViGEm users: none detected")
 
@@ -575,6 +589,11 @@ def probe_gamepad(do_test):
     except BaseException as e:
         say(f"  Could not create the virtual gamepad: {e}")
         say()
+        if others:
+            say(f"  {others[0][0]} also uses ViGEmBus and ships its own copy. Two")
+            say("  installations is a known cause of this. Test it, reversibly:")
+            say(f"    net stop {others[0][0]}     (admin; undo with net start ...)")
+            say()
         say("  What that sequence means: vigem_target_add first plugs the device in")
         say("  (Windows plays the connect chime), then waits for it to become ready.")
         say("  When that wait fails the client unplugs it again (disconnect chime)")
@@ -631,9 +650,20 @@ def probe_gamepad(do_test):
             return
 
         say()
+        # 这是功能 4 唯一还没答的问题，而窗口模式是关键变量：社区那条"后台也能
+        # 收手柄输入"的说法明确限定在"全屏窗口"（无边框）模式，普通窗口模式并不
+        # 在其列。在窗口模式下失焦不动，并不能推翻它。
+        say(f"  The game is currently in: {window_mode_label(hwnd)}")
+        say()
         say("  About to hold the left stick forward for 5 seconds.")
-        say("  First run : leave the game focused and watch the character.")
-        say("  Second run: Alt-Tab away and repeat. Still moving = feature 4 solved.")
+        say("  Run A: game focused          -> character should move")
+        say("  Run B: Alt-Tab away, repeat  -> THIS is the question")
+        say()
+        say("  If B fails, retry the whole thing with the game set to")
+        say("  'Full Screen Window' (borderless) in its display options. That mode")
+        say("  is the one reported to keep accepting controller input while in the")
+        say("  background; ordinary windowed mode is not, and testing windowed")
+        say("  proves nothing either way.")
         try:
             input("  Press Enter to start, Ctrl-C to cancel... ")
         except (EOFError, KeyboardInterrupt):
@@ -677,7 +707,7 @@ def run_all(args):
         say("  Skipped: no game window." if imports_ok else "  Skipped: imports failed.")
 
     probe_save()
-    probe_gamepad(args.gamepad_test or ask_gamepad_test(args))
+    probe_gamepad(args.gamepad_test or ask_gamepad_test(args), hwnd)
 
 
 def ask_gamepad_test(args):

@@ -548,3 +548,96 @@ class TestGamepadDetectionMustTryToConnect:
         assert "Only if the installer refuses" not in text
         assert "Download " not in text
         assert "Device Manager" in text
+
+
+class TestWindowModeIsReportedWithTheGamepadTest:
+    """手柄测试的结论完全取决于窗口模式。
+
+    社区那条"后台也能收手柄输入"的说法明确限定在"全屏窗口"（无边框）模式。
+    Howard 在普通窗口模式下测出失焦不动 —— 那并没有推翻它，只是测了另一件事。
+    报告必须自己说清楚当时是哪种模式。
+    """
+
+    def test_windowed_is_labelled_as_such(self, monkeypatch):
+        import types
+        monkeypatch.setitem(sys.modules, "win32api", types.SimpleNamespace(
+            GetWindowLong=lambda h, i: probe.WS_CAPTION))
+        monkeypatch.setitem(sys.modules, "win32gui", types.SimpleNamespace(
+            GetWindowRect=lambda h: (0, 0, 100, 100)))
+        assert "WINDOWED" in probe.window_mode_label(1234)
+
+    def test_borderless_is_labelled_with_its_size(self, monkeypatch):
+        import types
+        monkeypatch.setitem(sys.modules, "win32api", types.SimpleNamespace(
+            GetWindowLong=lambda h, i: probe.WS_POPUP))
+        monkeypatch.setitem(sys.modules, "win32gui", types.SimpleNamespace(
+            GetWindowRect=lambda h: (0, 0, 3840, 2160)))
+        label = probe.window_mode_label(5678)
+        assert "borderless" in label and "3840x2160" in label
+
+    def test_no_window_is_not_a_crash(self):
+        assert "unknown" in probe.window_mode_label(None)
+
+    def test_the_test_instructions_name_the_mode_to_retry_in(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delattr(sys, "frozen", raising=False)
+        path = probe.open_report()
+
+        class FakePad:
+            attempts_used = 1
+            def connect(self): pass
+            def close(self): pass
+            def left_stick_forward(self): pass
+            def neutral(self): pass
+
+        fake = type("V", (), {
+            "client_dll_path": staticmethod(lambda: __file__),
+            "driver_installed": staticmethod(lambda: (True, "1.22.0")),
+            "driver_service_present": staticmethod(lambda: True),
+            "loaded_driver_path": staticmethod(lambda: "x.sys"),
+            "bus_device_instances": staticmethod(lambda: ["ROOT\\SYSTEM\\0001"]),
+            "other_vigem_users": staticmethod(lambda: []),
+            "VirtualGamepad": FakePad,
+            "RETRY_ATTEMPTS": 3,
+            "DRIVER_VERSION": "1.22.0",
+            "DRIVER_DOWNLOAD_URL": "https://example/x.exe",
+        })
+        monkeypatch.setattr(probe, "vigem", fake)
+        monkeypatch.setattr(probe, "window_mode_label", lambda h: "ordinary WINDOWED (has a title bar)")
+        monkeypatch.setattr("builtins.input", lambda *a: "")
+        monkeypatch.setattr(probe.time, "sleep", lambda s: None)
+        probe.probe_gamepad(True, hwnd=1)
+        text = open(path, encoding="utf-8-sig").read()
+        assert "ordinary WINDOWED" in text, "报告要记下当时的窗口模式"
+        assert "Full Screen Window" in text, "要指明该在哪种模式下重测"
+        assert "proves nothing either way" in text
+
+    def test_a_healthy_connection_does_not_blame_cotenants(self, tmp_path, monkeypatch):
+        """连上了就别再说"两份安装是下面那个失败的常见原因" —— 下面没有失败。"""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delattr(sys, "frozen", raising=False)
+        path = probe.open_report()
+
+        class FakePad:
+            attempts_used = 1
+            def connect(self): pass
+            def close(self): pass
+
+        fake = type("V", (), {
+            "client_dll_path": staticmethod(lambda: __file__),
+            "driver_installed": staticmethod(lambda: (True, "1.22.0")),
+            "driver_service_present": staticmethod(lambda: True),
+            "loaded_driver_path": staticmethod(lambda: "x.sys"),
+            "bus_device_instances": staticmethod(lambda: ["ROOT\\SYSTEM\\0001"]),
+            "other_vigem_users": staticmethod(lambda: [("SunshineService", "Sunshine", 2)]),
+            "VirtualGamepad": FakePad,
+            "RETRY_ATTEMPTS": 3,
+            "DRIVER_VERSION": "1.22.0",
+            "DRIVER_DOWNLOAD_URL": "https://example/x.exe",
+        })
+        monkeypatch.setattr(probe, "vigem", fake)
+        probe.probe_gamepad(False, hwnd=1)
+        text = open(path, encoding="utf-8-sig").read()
+        assert "SunshineService" in text, "还是要列出来，只是不该当成故障原因"
+        assert "usual cause of the failure" not in text
+        assert "net stop" not in text
