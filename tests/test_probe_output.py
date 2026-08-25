@@ -641,3 +641,147 @@ class TestWindowModeIsReportedWithTheGamepadTest:
         assert "SunshineService" in text, "还是要列出来，只是不该当成故障原因"
         assert "usual cause of the failure" not in text
         assert "net stop" not in text
+
+
+class _FakeXInputDLL:
+    """XInputGetState 的替身：槽位 0 永远报告"摇杆推满"。"""
+
+    def XInputGetState(self, index, buf):
+        import xinput as _x
+        slot = index.value if hasattr(index, "value") else int(index)
+        if slot != 0:
+            return _x.ERROR_DEVICE_NOT_CONNECTED
+        buf._obj.dwPacketNumber = 1
+        buf._obj.Gamepad.sThumbLY = 32767
+        return _x.ERROR_SUCCESS
+
+
+class _FakePad:
+    def __init__(self):
+        self.closed = False
+        self.pushed = False
+
+    def connect(self):
+        pass
+
+    def left_stick_forward(self):
+        self.pushed = True
+
+    def neutral(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class TestInputBackendSection:
+    """第 6 段（#45 指纹）在 Linux 上也要能整段跑完而不炸。"""
+
+    def test_no_window_is_skipped_not_crashed(self, capsys):
+        assert probe.probe_input_backend(None) is None
+        assert "Skipped" in capsys.readouterr().out
+
+    def test_unreadable_process_tells_the_user_what_to_do(self, capsys, monkeypatch):
+        """游戏以管理员跑、探测器没有时的真实路径。"""
+        monkeypatch.setattr(probe.procinfo, "pid_for_window", lambda h: 4242)
+        monkeypatch.setattr(probe.procinfo, "process_modules",
+                            lambda pid: (None, "OpenProcess failed: error 5 (access denied)", None))
+        assert probe.probe_input_backend(1234) is None
+        out = capsys.readouterr().out
+        assert "access denied" in out
+        assert "Run as administrator" in out
+
+    def test_reports_the_backend_and_a_verdict(self, capsys, monkeypatch):
+        monkeypatch.setattr(probe.procinfo, "pid_for_window", lambda h: 4242)
+        monkeypatch.setattr(probe.procinfo, "process_modules", lambda pid: (
+            [r"C:\g\gbfr.exe", r"C:\W\S\xinput1_4.dll", r"C:\W\S\hid.dll"],
+            None, r"C:\g\gbfr.exe"))
+        assert probe.probe_input_backend(1234) == "xinput"
+        out = capsys.readouterr().out
+        assert "xinput1_4.dll" in out
+        assert "verdict: [xinput]" in out
+
+    def test_section_output_is_ascii(self, capsys, monkeypatch):
+        monkeypatch.setattr(probe.procinfo, "pid_for_window", lambda h: 4242)
+        monkeypatch.setattr(probe.procinfo, "process_modules", lambda pid: (
+            [r"C:\W\S\Windows.Gaming.Input.dll"], None, r"C:\g\gbfr.exe"))
+        probe.probe_input_backend(1234)
+        capsys.readouterr().out.encode("ascii")
+
+
+class TestXInputFocusSection:
+    """第 7 段是 #45 唯一的决定性测量，所以它的每条分支都要在这里走一遍。"""
+
+    def test_no_xinput_dll_stops_cleanly(self, capsys, monkeypatch):
+        monkeypatch.setattr(probe.xinput, "available_libraries", lambda: [])
+        probe.probe_xinput_focus(True)
+        assert "No XInput DLL" in capsys.readouterr().out
+
+    def test_without_the_flag_it_only_explains_itself(self, capsys, monkeypatch):
+        monkeypatch.setattr(probe.xinput, "available_libraries",
+                            lambda: [("xinput1_4.dll", object())])
+        probe.probe_xinput_focus(False)
+        out = capsys.readouterr().out
+        assert "--xinput-test" in out
+
+    def _arm(self, monkeypatch):
+        """把第 7 段接到假 DLL、假手柄、假前台窗口上。
+
+        刻意不在这里桩 sample_focus：每个用例关心的采样结果都不一样，由用例自己
+        给，helper 只负责让这一段能走到采样那一步。
+        """
+        pad = _FakePad()
+        monkeypatch.setattr(probe.xinput, "available_libraries",
+                            lambda: [("xinput1_4.dll", _FakeXInputDLL())])
+        monkeypatch.setattr(probe.xinput, "foreground_window", lambda: 777)
+        monkeypatch.setattr(probe.vigem, "VirtualGamepad", lambda: pad)
+        monkeypatch.setattr("builtins.input", lambda *a: "")
+        return pad
+
+    def test_os_gate_is_reported_when_unfocused_reads_neutral(self, capsys, monkeypatch):
+        """摇杆一直推着，但失焦时读到中立 —— 就是文档描述的那个门。"""
+        pad = self._arm(monkeypatch)
+
+        # 失焦后让 DLL 返回中立，模拟 Windows 把状态清零
+        import xinput as _x
+        samples = [_x.Sample(0, True, _x.Reading(1, 0, 0, 0, 0, 32767, 0, 0), False),
+                   _x.Sample(1, False, _x.Reading(2, 0, 0, 0, 0, 0, 0, 0), False)]
+        monkeypatch.setattr(probe.xinput, "sample_focus", lambda dll, **kw: samples)
+        monkeypatch.setattr(probe.xinput, "connected_slots", lambda dll: [0])
+
+        probe.probe_xinput_focus(True)
+        out = capsys.readouterr().out
+        assert "verdict: [os-gate]" in out
+        assert pad.closed, "虚拟手柄必须拔掉，否则摇杆会一直推着留在系统里"
+
+    def test_pad_is_unplugged_even_if_sampling_explodes(self, capsys, monkeypatch):
+        """采样炸了也必须拔手柄 —— 不然摇杆推满的虚拟设备就留在系统里了。"""
+        pad = self._arm(monkeypatch)
+        monkeypatch.setattr(probe.xinput, "connected_slots", lambda dll: [0])
+
+        def boom(dll, **kw):
+            raise RuntimeError("sampling died")
+
+        monkeypatch.setattr(probe.xinput, "sample_focus", boom)
+        with pytest.raises(RuntimeError):
+            probe.probe_xinput_focus(True)
+        assert pad.closed
+
+    def test_invisible_pad_stops_before_measuring(self, capsys, monkeypatch):
+        """手柄插上了但 XInput 看不见，此时任何读数都没有意义。"""
+        pad = self._arm(monkeypatch)
+        monkeypatch.setattr(probe.xinput, "connected_slots", lambda dll: [])
+        probe.probe_xinput_focus(True)
+        out = capsys.readouterr().out
+        assert "XInput cannot see it" in out
+        assert pad.closed
+
+    def test_section_output_is_ascii(self, capsys, monkeypatch):
+        import xinput as _x
+        self._arm(monkeypatch)
+        monkeypatch.setattr(probe.xinput, "connected_slots", lambda dll: [0])
+        monkeypatch.setattr(probe.xinput, "sample_focus", lambda dll, **kw: [
+            _x.Sample(0, True, _x.Reading(1, 0, 0, 0, 0, 32767, 0, 0), False),
+            _x.Sample(1, False, _x.Reading(2, 0, 0, 0, 0, 0, 0, 0), False)])
+        probe.probe_xinput_focus(True)
+        capsys.readouterr().out.encode("ascii")

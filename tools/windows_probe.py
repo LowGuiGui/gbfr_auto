@@ -6,6 +6,8 @@ PLANNING.md §5 列的问题只能在 Windows 上、开着游戏才能回答。�
 
     gbfr-probe.exe                 只读，不发任何输入
     gbfr-probe.exe --gamepad-test  额外做虚拟手柄测试（会向游戏发输入）
+    gbfr-probe.exe --xinput-test   量"失焦时 XInput 会不会被清零"（#45 的决定性
+                                   测量；不需要游戏在跑，只需要十几秒和一次点击）
     gbfr-probe.exe --title "关键字" 窗口标题对不上时指定
 
 只读。除了往当前文件夹写一份报告和一张截图之外，什么都不改。
@@ -21,6 +23,7 @@ import argparse
 import ctypes
 import os
 import sys
+import textwrap
 import time
 import traceback
 from datetime import datetime
@@ -39,6 +42,15 @@ try:
 except BaseException as _e:  # noqa: BLE001 - 任何导入期故障都要活下来
     vigem = None
     _VIGEM_ERROR = f"{type(_e).__name__}: {_e}"
+
+try:
+    import procinfo  # noqa: E402
+    import xinput  # noqa: E402
+    _INPUT_SCAN_ERROR = None
+except BaseException as _e:  # noqa: BLE001 - 同上，打包漏了也要出报告
+    procinfo = None
+    xinput = None
+    _INPUT_SCAN_ERROR = f"{type(_e).__name__}: {_e}"
 
 DEFAULT_TITLE = "Granblue"
 REPORT_NAME = "gbfr-probe-report.txt"
@@ -139,6 +151,16 @@ def section(title):
     say("=" * 68)
     say(title)
     say("=" * 68)
+
+
+def wrap(text, width=68):
+    """把一段判定说明折成报告里的等宽行。
+
+    判定文字来自 xinput / procinfo 两个模块，长度不受这里控制；报告的缩进又全是
+    手写的，所以折行必须在打印这一侧做。空字符串也要返回一行，否则调用点还得
+    单独判空。
+    """
+    return textwrap.wrap(text, width) or [""]
 
 
 # ---------------------------------------------------------------------------
@@ -683,6 +705,166 @@ def probe_gamepad(do_test, hwnd=None):
 
 
 # ---------------------------------------------------------------------------
+# 6. 游戏在用哪套输入 API
+# ---------------------------------------------------------------------------
+
+def probe_input_backend(hwnd):
+    section("6. Game's input backend  --  which #45 fix applies")
+
+    if procinfo is None:
+        say(f"  The procinfo module failed to import: {_INPUT_SCAN_ERROR}")
+        say("  >> This build is broken: the module was not bundled.")
+        return None
+
+    if not hwnd:
+        say("  Skipped: no game window, so there is no process to look at.")
+        return None
+
+    pid = procinfo.pid_for_window(hwnd)
+    if pid is None:
+        say("  Could not map the window to a process.")
+        return None
+    say(f"  pid           : {pid}")
+
+    paths, error, exe = procinfo.process_modules(pid)
+    if exe:
+        say(f"  image         : {exe}")
+    if paths is None:
+        say(f"  Could not list the loaded modules: {error}")
+        say()
+        say("  If that says access denied, the game is running elevated and this")
+        say("  probe is not. Right-click gbfr-probe.exe -> Run as administrator")
+        say("  and run it again. Everything else in this report is unaffected.")
+        return None
+
+    say(f"  modules loaded: {len(paths)}")
+    say()
+
+    found = procinfo.classify_modules(paths)
+    if not found:
+        say("  No recognised input DLL is loaded.")
+    for label, strength, hits in found:
+        mark = "  " if strength == "strong" else " ?"
+        say(f"  {mark} {label:<36} {', '.join(hits)}")
+    say()
+
+    code, explanation = procinfo.backend_verdict(found)
+    say(f"  verdict: [{code}]")
+    for line in wrap(explanation):
+        say(f"    {line}")
+    return code
+
+
+# ---------------------------------------------------------------------------
+# 7. XInput 失焦门 —— #45 的决定性测试
+# ---------------------------------------------------------------------------
+
+def probe_xinput_focus(do_test):
+    section("7. XInput focus gate  --  the decisive test for #45")
+
+    if xinput is None:
+        say(f"  The xinput module failed to import: {_INPUT_SCAN_ERROR}")
+        return
+
+    libs = xinput.available_libraries()
+    if not libs:
+        say("  No XInput DLL could be loaded at all. That is very unusual on")
+        say("  Windows; nothing below can run.")
+        return
+    say("  XInput DLLs present: " + ", ".join(name for name, _dll in libs))
+    say()
+    say("  Why this test exists: Microsoft documents that on Windows 10+ the")
+    say("  SYSTEM disables game controller input based on window focus, and that")
+    say("  a disabled XInput returns neutral data. A developer report on their own")
+    say("  Q&A says the opposite happens in practice. Whichever is true here")
+    say("  decides whether #45 is fixable by hooking the game at all.")
+    say()
+
+    if not do_test:
+        say("  Pass --xinput-test to run it. It needs about 15 seconds and one click.")
+        return
+
+    if vigem is None:
+        say("  Needs the virtual pad to have something to read, and the vigem")
+        say(f"  module failed to import: {_VIGEM_ERROR}")
+        return
+
+    name, dll = libs[0]
+    say(f"  Using {name} (first that loaded).")
+    say()
+    say("  What will happen: a virtual pad is plugged in and its left stick is")
+    say("  held forward. This process then reads XInputGetState ten times a")
+    say("  second for 12 seconds, recording which window was in front each time.")
+    say()
+    say("  WHAT YOU DO:")
+    say("    1. Press Enter.")
+    say("    2. Leave THIS window in front for about 4 seconds.")
+    say("    3. Then click on any other window and leave it in front.")
+    say()
+    say("  The game does not need to be running for this test.")
+    try:
+        input("  Press Enter to start, Ctrl-C to skip... ")
+    except (EOFError, KeyboardInterrupt):
+        say("  Skipped.")
+        return
+
+    baseline = xinput.foreground_window()
+    if baseline is None:
+        say("  Could not read the foreground window; cannot run the test.")
+        return
+
+    pad = vigem.VirtualGamepad()
+    try:
+        pad.connect()
+    except BaseException as e:
+        say(f"  Could not create the virtual gamepad: {e}")
+        say("  Section 5 above explains what to do about that.")
+        return
+
+    try:
+        slots = xinput.connected_slots(dll)
+        say(f"  pad visible on XInput slot(s): {slots if slots else 'none'}")
+        if not slots:
+            say("  >> The virtual pad is plugged in but XInput cannot see it.")
+            say("     Nothing below would mean anything; stopping here.")
+            return
+        slot = slots[0]
+
+        pad.left_stick_forward()
+        samples = xinput.sample_focus(
+            dll, index=slot, seconds=12.0, interval=0.1,
+            focus=xinput.baseline_watcher(baseline),
+        )
+    finally:
+        try:
+            pad.neutral()
+        finally:
+            pad.close()
+
+    buckets = xinput.summarize(samples)
+    say()
+    say(f"  samples: {len(samples)}")
+    say(f"    focused   + live    : {buckets['focused_live']}")
+    say(f"    focused   + NEUTRAL : {buckets['focused_neutral']}")
+    say(f"    unfocused + live    : {buckets['unfocused_live']}")
+    say(f"    unfocused + NEUTRAL : {buckets['unfocused_neutral']}")
+    say(f"    focus unknown       : {buckets['unknown']}")
+    say()
+
+    code, explanation = xinput.verdict(buckets)
+    say(f"  verdict: [{code}]")
+    for line in wrap(explanation):
+        say(f"    {line}")
+
+    caveat = xinput.focus_caveat(buckets)
+    if caveat:
+        say()
+        say("  Caveat:")
+        for line in wrap(caveat, 66):
+            say(f"    {line}")
+
+
+# ---------------------------------------------------------------------------
 
 def run_all(args):
     """跑完所有探测。任何一段抛出的异常由 main() 兜住并写进报告。"""
@@ -708,6 +890,8 @@ def run_all(args):
 
     probe_save()
     probe_gamepad(args.gamepad_test or ask_gamepad_test(args), hwnd)
+    probe_input_backend(hwnd)
+    probe_xinput_focus(args.xinput_test or ask_xinput_test(args))
 
 
 def ask_gamepad_test(args):
@@ -725,6 +909,26 @@ def ask_gamepad_test(args):
         return False
     chose = answer in ("y", "yes")
     say(f"  [interactive] gamepad test: {'yes' if chose else 'skipped'}")
+    return chose
+
+
+def ask_xinput_test(args):
+    """同 ask_gamepad_test：打包版双击运行时没法传参数，所以问一句。
+
+    问得比手柄那个更值得 —— 这一项是 #45 唯一的决定性测量，而且不需要游戏在跑，
+    所以任何一次探测都可以顺手做掉。
+    """
+    if args.xinput_test or not getattr(sys, "frozen", False):
+        return False
+    print()
+    print("  The XInput focus test answers the one open question for #45.")
+    print("  It needs ~15 seconds and one click. The game does not need to run.")
+    try:
+        answer = input("  Run the XInput focus test? (Y/n) ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    chose = answer in ("", "y", "yes")
+    say(f"  [interactive] xinput focus test: {'yes' if chose else 'skipped'}")
     return chose
 
 
@@ -762,6 +966,8 @@ def main():
                         help="substring of the game window title")
     parser.add_argument("--gamepad-test", action="store_true",
                         help="actually push the stick (default: only check the pad can be made)")
+    parser.add_argument("--xinput-test", action="store_true",
+                        help="measure whether Windows zeroes XInput while unfocused (#45)")
     args = parser.parse_args()
 
     if not sys.platform.startswith("win"):
