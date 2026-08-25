@@ -133,9 +133,21 @@ class TestAvailableLibraries:
             ("XInput9_1_0.dll", "handle-910"),
         ]
 
-    def test_load_library_returns_none_off_windows(self):
-        """Linux 上 ctypes 根本没有 WinDLL，不能让 AttributeError 逃出去。"""
-        assert xinput.load_library("xinput1_4.dll") is None
+    def test_load_library_never_raises(self):
+        """两个平台都不许抛异常，但"该返回什么"是平台相关的。
+
+        CI 会跑两遍：ubuntu 带桩，windows-latest **不带**桩。断言"返回 None"
+        在 Windows 上必错 —— xinput1_4.dll 是系统自带的，本来就该载入成功。
+        """
+        result = xinput.load_library("xinput1_4.dll")
+        if sys.platform.startswith("win"):
+            assert result is not None
+        else:
+            assert result is None, "Linux 上 ctypes 没有 WinDLL，AttributeError 必须被吃掉"
+
+    def test_load_library_returns_none_for_a_name_that_does_not_exist(self):
+        """这条在两个平台上都成立，所以它才是真正的护栏。"""
+        assert xinput.load_library("gbfr_not_a_real_xinput_dll.dll") is None
 
 
 class TestSampleFocus:
@@ -242,8 +254,13 @@ class TestBaselineWatcher:
         monkeypatch.setattr(xinput, "foreground_window", lambda: None)
         assert xinput.baseline_watcher(4242)() is None
 
-    def test_foreground_window_returns_none_off_windows(self):
-        assert xinput.foreground_window() is None
+    def test_foreground_window_never_raises(self):
+        """Windows 上真的有前台窗口，所以只能断言类型，不能断言 None。"""
+        result = xinput.foreground_window()
+        if sys.platform.startswith("win"):
+            assert result is None or isinstance(result, int)
+        else:
+            assert result is None
 
 
 class TestOwnProcessControl:

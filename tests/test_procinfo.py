@@ -8,6 +8,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import procinfo  # noqa: E402
@@ -114,13 +116,27 @@ class TestErrorText:
             procinfo._last_error_text(code).encode("ascii")
 
 
-class TestOffWindows:
-    def test_pid_for_window_returns_none(self):
-        """Linux 上 ctypes 没有 WinDLL，不能让 AttributeError 逃出去。"""
-        assert procinfo.pid_for_window(12345) is None
+class TestPlatformBoundary:
+    """CI 跑两遍：ubuntu 带桩，windows-latest **不带**桩。
 
-    def test_process_modules_reports_rather_than_raises(self):
+    所以这里只能断言两个平台都成立的契约 —— "永远不抛异常，要么给结果要么给
+    原因"。断言"在 Windows 上也返回 None"是错的，第一次提交就是这么挂的。
+    """
+
+    def test_pid_for_window_never_raises(self):
+        result = procinfo.pid_for_window(12345)
+        assert result is None or isinstance(result, int)
+
+    def test_process_modules_gives_a_result_or_a_reason(self):
         paths, error, exe = procinfo.process_modules(4321)
-        assert paths is None
-        assert exe is None
-        assert "Windows" in error
+        assert (paths is None) != (error is None), "要么拿到模块，要么拿到原因"
+        if error is not None:
+            assert error, "原因不能是空串"
+            error.encode("ascii")
+        else:
+            assert isinstance(paths, list)
+
+    def test_off_windows_says_so(self):
+        if sys.platform.startswith("win"):
+            pytest.skip("这条只描述非 Windows 上的行为")
+        assert procinfo.process_modules(4321)[1] == "not running on Windows"
