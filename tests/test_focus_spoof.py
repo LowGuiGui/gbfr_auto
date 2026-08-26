@@ -175,3 +175,66 @@ class TestWindowInputSurface:
     def test_stats_without_injection_is_none(self, wi):
         wi._hook_client = None
         assert wi.focus_spoof_stats() is None
+
+
+class TestParseStats:
+    LINE = "STATS on=1 fg=42 active=0 focus=0 kill=3 act=3 actapp=1"
+
+    def test_parses_every_counter(self):
+        stats = injector.parse_stats(self.LINE)
+        assert stats == {"on": 1, "fg": 42, "active": 0, "focus": 0,
+                         "kill": 3, "act": 3, "actapp": 1}
+
+    def test_tolerates_surrounding_whitespace(self):
+        assert injector.parse_stats("  " + self.LINE + "\r\n  ")["fg"] == 42
+
+    def test_rejects_anything_that_is_not_a_stats_line(self):
+        for junk in ("PONG", "", None, "HELLO\n", "on=1 fg=2"):
+            assert injector.parse_stats(junk) is None
+
+    def test_skips_malformed_tokens_instead_of_dying(self):
+        """管道上收到半截数据是完全可能的，不该让整段测试崩掉。"""
+        stats = injector.parse_stats("STATS fg=7 garbage active=x kill=2")
+        assert stats == {"fg": 7, "kill": 2}
+
+    def test_no_usable_tokens_is_none(self):
+        assert injector.parse_stats("STATS") is None
+
+
+class TestStatsVerdict:
+    def _verdict(self, **counters):
+        base = {"on": 0, "fg": 0, "active": 0, "focus": 0,
+                "kill": 0, "act": 0, "actapp": 0}
+        base.update(counters)
+        return injector.stats_verdict(base)[0]
+
+    def test_polling_game(self):
+        assert self._verdict(fg=120) == "polls"
+
+    def test_message_driven_game(self):
+        assert self._verdict(kill=4, actapp=4) == "messages"
+
+    def test_both_paths(self):
+        assert self._verdict(fg=90, kill=3) == "both"
+
+    def test_nothing_intercepted_is_the_alarming_one(self):
+        """两边都是 0 = IAT 补丁没打中。这是最需要立刻知道的情况。"""
+        code, text = self._verdict(), injector.stats_verdict(
+            {"fg": 0, "kill": 0})[1]
+        assert code == "no-hooks-hit"
+        assert "widening" in text
+
+    def test_missing_stats(self):
+        assert injector.stats_verdict(None)[0] == "no-data"
+
+    def test_the_on_flag_does_not_affect_the_verdict(self):
+        """on 只是状态，不是证据 —— 计数器在伪装关着时也照样累加。"""
+        assert self._verdict(on=1, fg=5) == self._verdict(on=0, fg=5)
+
+    def test_every_explanation_is_ascii(self):
+        for counters in ({}, {"fg": 1}, {"kill": 1}, {"fg": 1, "kill": 1}):
+            base = {"fg": 0, "active": 0, "focus": 0,
+                    "kill": 0, "act": 0, "actapp": 0}
+            base.update(counters)
+            injector.stats_verdict(base)[1].encode("ascii")
+        injector.stats_verdict(None)[1].encode("ascii")

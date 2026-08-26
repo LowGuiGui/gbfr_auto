@@ -1035,3 +1035,158 @@ class TestCaveatDirection:
         assert "verdict: [no-os-gate]" in out
         assert "STRONGER" in out
         assert "WARNING" not in out
+
+
+class _FakeWI:
+    """WindowInput 的替身，记录被调用的顺序。"""
+
+    def __init__(self, stats="STATS on=0 fg=30 active=0 focus=0 kill=0 act=0 actapp=0",
+                 inject_ok=True, inject_raises=None):
+        self.calls = []
+        self._stats = stats
+        self._inject_ok = inject_ok
+        self._inject_raises = inject_raises
+
+    def set_target(self, hwnd):
+        self.calls.append(("target", hwnd))
+
+    def enable_inject(self, progress_cb=None):
+        self.calls.append(("inject",))
+        if self._inject_raises:
+            raise self._inject_raises
+        return self._inject_ok
+
+    def focus_spoof_stats(self):
+        self.calls.append(("stats",))
+        return self._stats
+
+    def enable_focus_spoof(self):
+        self.calls.append(("spoof_on",))
+        return True
+
+    def disable_focus_spoof(self):
+        self.calls.append(("spoof_off",))
+        return True
+
+
+class TestFocusHookSection:
+    """第 9 段是整个探测器里唯一会**改变游戏进程**的部分。守住它的门。"""
+
+    @pytest.fixture(autouse=True)
+    def _no_waiting(self, monkeypatch):
+        monkeypatch.setattr(probe.time, "sleep", lambda _s: None)
+
+    def _arm(self, monkeypatch, wi, answers):
+        replies = iter(answers)
+        monkeypatch.setattr("builtins.input", lambda *a: next(replies, ""))
+        monkeypatch.setattr(probe.window_input, "WindowInput", lambda: wi)
+        return wi
+
+    def test_without_the_flag_it_warns_before_anything_happens(self, capsys):
+        probe.probe_focus_hook(False, 1234)
+        out = capsys.readouterr().out
+        assert "INJECTS A DLL" in out
+        assert "cannot be unloaded" in out
+        assert "--focus-hook-test" in out
+
+    def test_no_window_is_skipped(self, capsys):
+        probe.probe_focus_hook(True, None)
+        assert "window was not found" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("answer", ["", "y", "yes", "INJECT ME", "no", "n"])
+    def test_only_the_exact_word_inject_proceeds(self, capsys, monkeypatch, answer):
+        """安全属性：除了正好输入 inject，任何输入都不能注入。
+
+        'y' 也不行 —— 这一步和别处的 y/N 提示不是一回事，手滑不该把 DLL 塞进
+        游戏进程。
+        """
+        wi = _FakeWI()
+        self._arm(monkeypatch, wi, [answer])
+        probe.probe_focus_hook(True, 1234)
+        assert wi.calls == [], f"{answer!r} 不该导致任何动作"
+        assert "Skipped" in capsys.readouterr().out
+
+    def test_the_word_inject_is_accepted_case_insensitively(self, monkeypatch):
+        wi = _FakeWI()
+        self._arm(monkeypatch, wi, ["  Inject  ", ""])
+        probe.probe_focus_hook(True, 1234)
+        assert ("inject",) in wi.calls
+
+    def test_injection_failure_points_at_elevation(self, capsys, monkeypatch):
+        wi = _FakeWI(inject_raises=OSError("access is denied"))
+        self._arm(monkeypatch, wi, ["inject"])
+        probe.probe_focus_hook(True, 1234)
+        out = capsys.readouterr().out
+        assert "Run as administrator" in out
+        assert ("stats",) not in wi.calls
+
+    def test_stage1_reports_the_mechanism(self, capsys, monkeypatch):
+        wi = _FakeWI(stats="STATS on=0 fg=120 active=0 focus=0 kill=0 act=0 actapp=0")
+        self._arm(monkeypatch, wi, ["inject", "", "n"])
+        probe.probe_focus_hook(True, 1234)
+        out = capsys.readouterr().out
+        assert "mechanism: [polls]" in out
+        assert "GetForegroundWindow=120" in out
+
+    def test_message_driven_game_is_named(self, capsys, monkeypatch):
+        wi = _FakeWI(stats="STATS on=0 fg=0 active=0 focus=0 kill=4 act=4 actapp=2")
+        self._arm(monkeypatch, wi, ["inject", "", "n"])
+        probe.probe_focus_hook(True, 1234)
+        assert "mechanism: [messages]" in capsys.readouterr().out
+
+    def test_nothing_intercepted_stops_before_stage2(self, capsys, monkeypatch):
+        """两边都是 0 时 stage 2 什么也证明不了 —— 不该白跑一遍。"""
+        wi = _FakeWI(stats="STATS on=0 fg=0 active=0 focus=0 kill=0 act=0 actapp=0")
+        self._arm(monkeypatch, wi, ["inject", "", "y"])
+        probe.probe_focus_hook(True, 1234)
+        out = capsys.readouterr().out
+        assert "mechanism: [no-hooks-hit]" in out
+        assert "would prove nothing" in out
+        assert ("spoof_on",) not in wi.calls
+
+    def test_spoofing_is_turned_off_even_when_stage1_explodes(self, monkeypatch):
+        """伪装开着而用户不知道，是这一段最坏的结局。"""
+        wi = _FakeWI()
+        self._arm(monkeypatch, wi, ["inject"])
+
+        def boom(*a, **kw):
+            raise RuntimeError("stage 1 died")
+
+        monkeypatch.setattr(probe, "_focus_hook_stage1", boom)
+        with pytest.raises(RuntimeError):
+            probe.probe_focus_hook(True, 1234)
+        assert ("spoof_off",) in wi.calls
+
+    def test_stage2_measures_and_reports(self, capsys, monkeypatch):
+        wi = _FakeWI(stats="STATS on=0 fg=99 active=0 focus=0 kill=0 act=0 actapp=0")
+        self._arm(monkeypatch, wi, ["inject", "", "y"])
+        focus = iter([True, False])
+        monkeypatch.setattr(probe, "_game_is_focused", lambda h: next(focus, False))
+        phases = iter([_stats(20.0), _stats(19.0)])
+        monkeypatch.setattr(probe, "_capture_deltas", lambda h, **kw: (next(phases), 0))
+
+        probe.probe_focus_hook(True, 1234)
+        out = capsys.readouterr().out
+        assert ("spoof_on",) in wi.calls
+        assert "verdict: [running]" in out
+        assert "#45 solved" in out
+        assert ("spoof_off",) in wi.calls
+
+    def test_stage2_says_so_when_the_spoof_did_not_work(self, capsys, monkeypatch):
+        wi = _FakeWI(stats="STATS on=0 fg=99 active=0 focus=0 kill=0 act=0 actapp=0")
+        self._arm(monkeypatch, wi, ["inject", "", "y"])
+        focus = iter([True, False])
+        monkeypatch.setattr(probe, "_game_is_focused", lambda h: next(focus, False))
+        phases = iter([_stats(20.0), _stats(0.4)])
+        monkeypatch.setattr(probe, "_capture_deltas", lambda h, **kw: (next(phases), 0))
+
+        probe.probe_focus_hook(True, 1234)
+        out = capsys.readouterr().out
+        assert "verdict: [frozen]" in out
+        assert "did not stop the pause" in out
+
+    def test_section_output_is_ascii(self, capsys, monkeypatch):
+        wi = _FakeWI(stats="STATS on=0 fg=99 active=0 focus=0 kill=2 act=0 actapp=0")
+        self._arm(monkeypatch, wi, ["inject", "", "n"])
+        probe.probe_focus_hook(True, 1234)
+        capsys.readouterr().out.encode("ascii")

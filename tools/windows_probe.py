@@ -59,6 +59,18 @@ except BaseException as _e:  # noqa: BLE001 - numpy 没打进去也要出报告
     framediff = None
     _FRAMEDIFF_ERROR = f"{type(_e).__name__}: {_e}"
 
+# 注入那条路。**模块级导入是刻意的**：hook/ 没有 __init__.py，是个命名空间包，
+# 而 PyInstaller 对命名空间包的静态分析本来就弱 —— 写在函数里更容易被漏掉，然后
+# 在用户机器上才炸。放在这里，CI 的 warn 文件检查也能看见它。
+try:
+    import window_input  # noqa: E402
+    from hook import injector as hook_injector  # noqa: E402
+    _INJECT_ERROR = None
+except BaseException as _e:  # noqa: BLE001 - 漏打包也要出报告，不能整个崩掉
+    window_input = None
+    hook_injector = None
+    _INJECT_ERROR = f"{type(_e).__name__}: {_e}"
+
 DEFAULT_TITLE = "Granblue"
 REPORT_NAME = "gbfr-probe-report.txt"
 CAPTURE_NAME = "gbfr-probe-capture.png"
@@ -1058,6 +1070,187 @@ def probe_focus_behaviour(do_test, hwnd):
 
 
 # ---------------------------------------------------------------------------
+# 9. 焦点钩子 —— #45 的修法，先观察再试
+# ---------------------------------------------------------------------------
+
+def _spoof_countdown(seconds, message):
+    say(f"  {message}")
+    for i in range(seconds, 0, -1):
+        print(f"    ...{i}", end="\r", flush=True)
+        time.sleep(1)
+    print("         ", end="\r")
+
+
+def probe_focus_hook(do_test, hwnd):
+    section("9. Focus hook  --  the #45 fix, observed then tested")
+
+    say("  Measured (PLANNING.md 5.3): Windows does not gate XInput, the game")
+    say("  reads the pad fine, and the game PAUSES ITSELF on focus loss. So the")
+    say("  fix is to stop it noticing. This section tries that.")
+    say()
+
+    if window_input is None:
+        say(f"  The injection modules failed to import: {_INJECT_ERROR}")
+        say("  >> This build is broken: they were not bundled.")
+        return
+    if framediff is None:
+        say(f"  The framediff module failed to import: {_FRAMEDIFF_ERROR}")
+        return
+    if not hwnd:
+        say("  Skipped: the game window was not found.")
+        return
+
+    if not do_test:
+        say("  Pass --focus-hook-test to run it.")
+        say()
+        say("  READ THIS FIRST. Unlike every other section, it INJECTS A DLL into")
+        say("  the game process. Specifically:")
+        say("    - it loads hook/gbfr_hook.dll into Granblue Fantasy: Relink")
+        say("    - focus spoofing starts OFF, so stage 1 changes NO behaviour")
+        say("    - the DLL cannot be unloaded again; it stays until the game exits")
+        say("  Stage 2 asks separately before changing anything.")
+        return
+
+    say("  ** This section INJECTS A DLL into the running game. **")
+    say()
+    say("  Everything else in this probe only reads. This does not.")
+    say()
+    say("    - loads hook/gbfr_hook.dll into the game process")
+    say("    - spoofing starts OFF: stage 1 only counts, changes nothing")
+    say("    - THE DLL CANNOT BE UNLOADED. It stays until the game exits.")
+    say("    - if anything goes wrong, closing the game clears it completely")
+    say()
+    say("  Do not do this in the middle of a run you care about.")
+    say()
+    try:
+        answer = input("  Type  inject  to proceed, anything else to skip: ")
+    except (EOFError, KeyboardInterrupt):
+        say("  Skipped.")
+        return
+    if answer.strip().lower() != "inject":
+        say(f"  Skipped (got {answer.strip()!r}).")
+        return
+
+    wi = window_input.WindowInput()
+    wi.set_target(hwnd)
+    say()
+    say("  Injecting...")
+    try:
+        ok = wi.enable_inject(progress_cb=lambda m: say(f"    {m}"))
+    except BaseException as e:
+        say(f"  Injection failed: {type(e).__name__}: {e}")
+        say()
+        say("  If that mentions access or a handle, the game is running at a")
+        say("  higher privilege level than this probe -- Reloaded-II runs as")
+        say("  admin, so the game does too. Right-click gbfr-probe.exe ->")
+        say("  Run as administrator and try again.")
+        return
+    if not ok:
+        say("  Injection reported failure. Nothing was changed.")
+        return
+    say("  >> Injected, and the pipe is connected.")
+
+    try:
+        _focus_hook_stage1(wi, hwnd)
+    finally:
+        # 无论如何都要把伪装关掉。DLL 留在进程里没办法，但它必须是"什么都不做"
+        # 的状态 —— 否则游戏会一直以为自己是前台，而用户并不知道。
+        try:
+            wi.disable_focus_spoof()
+        except BaseException:  # noqa: BLE001
+            pass
+        say()
+        say("  Focus spoofing is OFF again. The DLL stays loaded until the game")
+        say("  exits, but in this state it only counts calls -- it changes nothing.")
+
+
+def _focus_hook_stage1(wi, hwnd):
+    say()
+    say("  --- Stage 1: observe. Spoofing is OFF; nothing changes. ---")
+    say()
+    say("  Alt-tab AWAY from the game and BACK, three times. Take your time.")
+    say("  The counters record how the game noticed each time.")
+    try:
+        input("  Press Enter when you have done that... ")
+    except (EOFError, KeyboardInterrupt):
+        say("  Skipped.")
+        return
+
+    raw = wi.focus_spoof_stats()
+    say(f"  raw: {raw}")
+    stats = hook_injector.parse_stats(raw)
+    if stats:
+        say(f"    polls    GetForegroundWindow={stats.get('fg', 0)}"
+            f"  GetActiveWindow={stats.get('active', 0)}"
+            f"  GetFocus={stats.get('focus', 0)}")
+        say(f"    messages WM_KILLFOCUS={stats.get('kill', 0)}"
+            f"  WM_ACTIVATE={stats.get('act', 0)}"
+            f"  WM_ACTIVATEAPP={stats.get('actapp', 0)}")
+    code, explanation = hook_injector.stats_verdict(stats)
+    say()
+    say(f"  mechanism: [{code}]")
+    for line in wrap(explanation):
+        say(f"    {line}")
+
+    if code in ("no-hooks-hit", "no-data"):
+        say()
+        say("  Stage 2 would prove nothing from here -- if nothing is being")
+        say("  intercepted, turning the spoof on cannot change the outcome.")
+        say("  Stopping. Send this section back; the hook needs widening.")
+        return
+
+    say()
+    say("  --- Stage 2: actually lie to the game. ---")
+    say()
+    say("  This makes the game believe it is focused. If it works, the game")
+    say("  keeps running while you are in another window.")
+    say("  Be in a quest with visible motion, as in section 8.")
+    try:
+        answer = input("  Run stage 2? (y/N) ")
+    except (EOFError, KeyboardInterrupt):
+        say("  Skipped.")
+        return
+    if answer.strip().lower() not in ("y", "yes"):
+        say("  Stage 2 skipped.")
+        return
+
+    _spoof_countdown(5, "Click the GAME window now.")
+    if _game_is_focused(hwnd) is False:
+        say("  >> The game is not in front; the baseline would be wrong. Stopping.")
+        return
+    say("  Baseline: game focused, spoofing off")
+    before, _ = _capture_deltas(hwnd)
+    _report_phase("focused + idle", before, 0)
+
+    if not wi.enable_focus_spoof():
+        say("  >> Could not turn spoofing on.")
+        return
+    say("  >> Spoofing ON: the game is now told it is always focused.")
+
+    _spoof_countdown(5, "Now click ANY OTHER window and leave it in front.")
+    if _game_is_focused(hwnd) is True:
+        say("  >> The game is still in front; this would not test anything.")
+        return
+    say("  Measuring: game unfocused, spoofing ON")
+    after, _ = _capture_deltas(hwnd)
+    _report_phase("unfocused + spoofed", after, 0)
+
+    say()
+    code, explanation = framediff.motion_verdict(before, after)
+    say(f"  verdict: [{code}]")
+    for line in wrap(explanation):
+        say(f"    {line}")
+    say()
+    if code == "running":
+        say("  >> That is #45 solved: the game kept running while unfocused.")
+    elif code == "frozen":
+        say("  >> The spoof did not stop the pause. The game noticed some other")
+        say("     way -- see PLANNING.md 5.1 for what is left to try.")
+    say("  Compare against section 8's numbers, which were taken WITHOUT the")
+    say("  spoof. That comparison is the whole result.")
+
+
+# ---------------------------------------------------------------------------
 
 def run_all(args):
     """跑完所有探测。任何一段抛出的异常由 main() 兜住并写进报告。"""
@@ -1086,6 +1279,7 @@ def run_all(args):
     probe_input_backend(hwnd)
     probe_xinput_focus(args.xinput_test or ask_xinput_test(args))
     probe_focus_behaviour(args.focus_test, hwnd)
+    probe_focus_hook(args.focus_hook_test, hwnd)
 
 
 def ask_gamepad_test(args):
@@ -1164,6 +1358,8 @@ def main():
                         help="measure whether Windows zeroes XInput while unfocused (#45)")
     parser.add_argument("--focus-test", action="store_true",
                         help="measure whether the game freezes or just ignores input (#45)")
+    parser.add_argument("--focus-hook-test", action="store_true",
+                        help="INJECT the hook DLL and try the #45 focus spoof (asks first)")
     args = parser.parse_args()
 
     if not sys.platform.startswith("win"):

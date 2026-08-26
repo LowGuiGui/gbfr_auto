@@ -95,6 +95,64 @@ def inject_dll(pid, dll_path):
         win32api.CloseHandle(h_process)
 
 
+# --- SPOOF_STATS 的解析与解读（#45）---------------------------------------
+#
+# DLL 回的是一行： STATS on=1 fg=42 active=0 focus=0 kill=3 act=3 actapp=1
+#
+# 这几个计数器是**外部探测器永远看不到的那一面**：游戏究竟是轮询"我在前台吗"，
+# 还是等窗口消息通知它。两条路的修法不同，而且如果两边都是 0，说明 IAT 补丁根本
+# 没打中 —— 那才是最需要立刻知道的情况。
+#
+# 纯函数，放在这里是因为它属于协议；Linux 上可完整测试。
+
+def parse_stats(text):
+    """把 STATS 行拆成 dict。不是 STATS 行就返回 None。"""
+    if not text:
+        return None
+    text = text.strip()
+    if not text.startswith("STATS"):
+        return None
+    out = {}
+    for token in text.split()[1:]:
+        key, sep, value = token.partition("=")
+        if not sep:
+            continue
+        try:
+            out[key] = int(value)
+        except ValueError:
+            continue
+    return out or None
+
+
+def stats_verdict(stats):
+    """计数器说明游戏靠什么察觉失焦。返回 (代号, 一行 ASCII 说明)。"""
+    if not stats:
+        return ("no-data", "No counters came back. The DLL may not be connected.")
+
+    poll = stats.get("fg", 0) + stats.get("active", 0) + stats.get("focus", 0)
+    msgs = stats.get("kill", 0) + stats.get("act", 0) + stats.get("actapp", 0)
+
+    if poll == 0 and msgs == 0:
+        return ("no-hooks-hit",
+                "Nothing was intercepted at all. Either the game never lost focus "
+                "during the test, or the IAT patch missed -- the focus logic may "
+                "live in a DLL rather than the exe, or be resolved through "
+                "GetProcAddress. The hook needs widening before the spoof can work.")
+    if poll and not msgs:
+        return ("polls",
+                "The game POLLS for focus (GetForegroundWindow / GetActiveWindow / "
+                "GetFocus). The IAT patch is the part that matters; the window-proc "
+                "subclass is not carrying this.")
+    if msgs and not poll:
+        return ("messages",
+                "The game is TOLD by window messages (WM_KILLFOCUS / WM_ACTIVATE / "
+                "WM_ACTIVATEAPP). The subclass is the part that matters; the IAT "
+                "patch is not carrying this.")
+    return ("both",
+            "Both paths fired. Covering both was the right call -- neither one "
+            "alone would have been enough to be sure.")
+
+
 class HookClient:
     """命名管道服务端，等待注入的 DLL 连接并向其发送命令"""
 
