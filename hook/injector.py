@@ -250,3 +250,44 @@ class HookClient:
             log.debug("PING 探活失败，判定连接已断", exc_info=True)
             self.disconnect()
             return False
+
+    # --- 焦点伪装（#45）-----------------------------------------------------
+    #
+    # 实测结论（PLANNING.md §5.3）：Windows 并没有按前台把 XInput 清零，游戏
+    # 手柄读得好好的，是**游戏自己在失焦时把自己暂停了**。所以要做的不是换一种
+    # 送输入的方式，而是让游戏察觉不到自己进了后台。
+    #
+    # 默认关闭。注入本身不改变游戏的任何行为 —— 这一点是刻意保留的。
+
+    def spoof_on(self, hwnd):
+        """让游戏相信自己一直是前台窗口。
+
+        hwnd 由这边传过去：注入方本来就知道自己盯的是哪个窗口，让 DLL 在进程
+        内部去猜只会更差。
+        """
+        return self._send(f"SPOOF_ON:{int(hwnd)}")
+
+    def spoof_off(self):
+        """恢复真相。DLL 卸载时也会自动做一次。"""
+        return self._send("SPOOF_OFF")
+
+    def spoof_stats(self):
+        """问 DLL 各个钩子被调用了多少次。拿不到返回 None。
+
+        这是**外部探测器永远看不到的那一面**：游戏到底是靠轮询
+        (GetForegroundWindow / GetActiveWindow / GetFocus) 还是靠窗口消息
+        (WM_KILLFOCUS / WM_ACTIVATE / WM_ACTIVATEAPP) 察觉失焦。计数器在伪装
+        关闭时也照常累加，所以这条在"只观察、不改行为"的模式下就能用。
+
+        某一项一直是 0，就说明那条路径不是答案。
+        """
+        if not self._pipe:
+            return None
+        try:
+            win32file.WriteFile(self._pipe, b"SPOOF_STATS\n")
+            resp, _ = win32file.ReadFile(self._pipe, 256)
+            return resp.decode("ascii", "replace").strip()
+        except Exception:
+            log.debug("SPOOF_STATS 读取失败", exc_info=True)
+            self.disconnect()
+            return None

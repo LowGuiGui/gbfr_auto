@@ -314,6 +314,35 @@ class WindowInput:
 
     def disable_inject(self):
         if self._hook_client:
+            # 先停伪装再断连：断了以后就没有通道叫它恢复了，只能等 DLL 卸载。
+            try:
+                self._hook_client.spoof_off()
+            except Exception:
+                log.debug("断开前关闭焦点伪装失败", exc_info=True)
             self._hook_client.disconnect()
             self._hook_client = None
         self._mode = self.MODE_FALLBACK
+
+    # --- 焦点伪装（#45）-----------------------------------------------------
+
+    def enable_focus_spoof(self):
+        """让游戏以为自己一直是前台。需要先注入。
+
+        实测（PLANNING.md §5.3）：游戏失焦时是**自己把自己暂停了**，不是收不到
+        输入。所以这一条才是功能 4 缺的那块，而不是换输入通道。
+        """
+        if not self._hook_client or self._hwnd is None:
+            log.warning("焦点伪装需要先注入并选中窗口")
+            return False
+        return self._hook_client.spoof_on(self._hwnd)
+
+    def disable_focus_spoof(self):
+        if not self._hook_client:
+            return False
+        return self._hook_client.spoof_off()
+
+    def focus_spoof_stats(self):
+        """各个钩子被调用了多少次。伪装关着的时候也有效 —— 那就是"只观察"模式。"""
+        if not self._hook_client:
+            return None
+        return self._hook_client.spoof_stats()
