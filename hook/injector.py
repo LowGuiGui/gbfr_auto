@@ -204,6 +204,35 @@ def stats_verdict(stats):
             "alone would have been enough to be sure.")
 
 
+def delivery_verdict(sent, stats):
+    """指令到底有没有走到 DLL 手里。返回 (代号, 一行 ASCII 说明)；判断不了返回 None。
+
+    Python 这边最多只能说"写调用返回了成功"，而那和"DLL 收到并执行了"不是同一个
+    命题：管道收下了字节、DLL 却没解析出来，从这边看完全一样。cmds 是在管道**另
+    一头**数出来的，所以它是唯一能把"我们没发"和"发了但没到"分开的证据。
+
+    这正是 #45 那次的教训的一般形式：注入模式一旦坏掉，表现是脚本安静地什么都不
+    做，而不是报错。
+    """
+    if not stats or "cmds" not in stats:
+        return None
+    cmds = stats.get("cmds", 0)
+    bad = stats.get("bad", 0)
+    if sent > 0 and cmds == 0:
+        return ("not-delivered",
+                f"We sent {sent} command(s) and the DLL executed none of them. "
+                "The pipe took the bytes and nothing acted on them, so every "
+                "keypress sent through inject mode is going nowhere -- and "
+                "nothing anywhere would have said so.")
+    if bad > 0:
+        return ("garbled",
+                f"The DLL could not parse {bad} line(s) it received. Commands "
+                "are arriving damaged, or the two sides disagree on a name. "
+                "%TEMP%\\gbfr_hook.log records each rejected line.")
+    return ("delivered",
+            f"The DLL executed {cmds} command(s) and rejected none.")
+
+
 class HookClient:
     """命名管道服务端，等待注入的 DLL 连接并向其发送命令"""
 
@@ -216,6 +245,9 @@ class HookClient:
         # 字节管道的收包缓冲。一次读回来可能是半行，也可能是好几行粘在一起，
         # 读剩下的那半行必须留到下一次读，不能丢。
         self._rx = b""
+        # 我们往管道上写成功了多少条。单独看它没有意义 —— 要跟 DLL 报回来的
+        # cmds 对着看，才知道"发出去"和"到了"是不是同一回事。见 delivery_verdict。
+        self._sent = 0
 
     def _create_server(self):
         try:
@@ -387,9 +419,17 @@ class HookClient:
     def _write_raw(self, data, timeout_ms=REPLY_TIMEOUT_MS):
         """往管道写一段字节。写不出去就等于连接已经没了。"""
         # WriteFile 返回 (errCode, nBytesWritten)，要的是第一个。
-        return self._overlapped_io(
+        ok = self._overlapped_io(
             lambda ov: win32file.WriteFile(self._pipe, data, ov)[0],
             timeout_ms) is not None
+        if ok:
+            self._sent += 1
+        return ok
+
+    @property
+    def sent_count(self):
+        """这个连接上写成功过多少条指令。delivery_verdict 的分母。"""
+        return self._sent
 
     def _read_raw(self, timeout_ms):
         """从管道读一段字节。超时或出错返回 None。"""
@@ -455,7 +495,7 @@ class HookClient:
     def mouse_release(self, x, y, button="left"):
         return self._send(f"MOUSE_UP:{x},{y},{button}")
 
-    def ping(self):
+    def ping(self, timeout_ms=REPLY_TIMEOUT_MS):
         if not self._pipe:
             return False
         if not self._write_raw(b"PING\n"):
@@ -464,7 +504,7 @@ class HookClient:
             return False
         # 只认 PONG 那一行。DLL 刚连上时发的 HELLO 也躺在管道里，原来那句
         # `b"PONG" in resp` 撞上它就会把一条活着的连接判成死的。
-        if self._await_reply("PONG") is None:
+        if self._await_reply("PONG", timeout_ms) is None:
             log.debug("PING 没等到 PONG，判定连接已断: %s", self._last_error)
             self.disconnect()
             return False

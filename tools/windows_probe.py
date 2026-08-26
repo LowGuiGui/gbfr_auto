@@ -1205,6 +1205,17 @@ def _focus_hook_stage1(wi, hwnd):
         say(f"    messages WM_KILLFOCUS={stats.get('kill', 0)}"
             f"  WM_ACTIVATE={stats.get('act', 0)}"
             f"  WM_ACTIVATEAPP={stats.get('actapp', 0)}")
+
+    # 指令有没有真的走到对面。这一条是在管道**另一头**数出来的，所以它能回答
+    # Python 这边永远回答不了的那个问题：写调用说成功了，DLL 到底收到没有。
+    delivery = hook_injector.delivery_verdict(
+        getattr(wi, "commands_sent", 0), stats)
+    if delivery:
+        say()
+        say(f"  delivery: [{delivery[0]}]")
+        for line in wrap(delivery[1]):
+            say(f"    {line}")
+
     code, explanation = hook_injector.stats_verdict(stats)
     say()
     say(f"  mechanism: [{code}]")

@@ -124,7 +124,32 @@ def wired():
     c._pipe = object()
     c._last_error = None
     c._rx = b""
+    c._sent = 0
     return c
+
+
+@pytest.fixture
+def warnings_from_injector():
+    """收集 injector / window_input 打出来的 WARNING 及以上。
+
+    不用 caplog：applog.setup() 会把 gbfr 这个 logger 的 propagate 关掉，而那是
+    进程级的副作用，跑没跑过取决于测试顺序。自己挂 handler 就与顺序无关。
+    """
+    import logging
+    records = []
+
+    class Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    logger = logging.getLogger("gbfr")
+    handler = Collect(level=logging.WARNING)
+    old_level = logger.level
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+    yield records
+    logger.removeHandler(handler)
+    logger.setLevel(old_level)
 
 
 @pytest.fixture
@@ -135,6 +160,7 @@ def client():
     c._pipe = object()
     c._last_error = None
     c._rx = b""
+    c._sent = 0
     c.sent = []
 
     def fake_send(cmd):
@@ -305,6 +331,179 @@ class TestReplyFraming:
         win32([b"HELLO\n"])
         wired.disconnect = lambda: None
         assert wired.ping() is False
+
+
+class TestDeliveryVerdict:
+    """"写调用成功了"和"DLL 收到了"是两个命题。cmds 是在管道另一头数的，所以
+    它是唯一能把两者分开的证据 —— 也是唯一能发现"注入模式在安静地空转"的办法。
+    """
+
+    def test_sent_but_nothing_executed_is_the_alarming_one(self):
+        code, text = injector.delivery_verdict(12, {"cmds": 0, "bad": 0})
+        assert code == "not-delivered"
+        assert "going nowhere" in text
+
+    def test_executed_commands_are_reported_as_delivered(self):
+        assert injector.delivery_verdict(3, {"cmds": 3, "bad": 0})[0] == "delivered"
+
+    def test_rejected_lines_mean_corruption_not_silence(self):
+        """DLL 收到了但解析不了 —— 管道把指令拆坏了，或者两边字面量不一致。"""
+        code, text = injector.delivery_verdict(5, {"cmds": 4, "bad": 1})
+        assert code == "garbled"
+        assert "damaged" in text
+
+    def test_an_older_dll_without_cmds_gives_no_verdict(self):
+        """不知道就说不知道，别硬报一个"没送到"。"""
+        assert injector.delivery_verdict(5, {"fg": 1}) is None
+        assert injector.delivery_verdict(5, None) is None
+
+    def test_nothing_sent_is_not_an_alarm(self):
+        assert injector.delivery_verdict(0, {"cmds": 0, "bad": 0})[0] == "delivered"
+
+    def test_every_explanation_is_ascii(self):
+        for sent, stats in ((9, {"cmds": 0, "bad": 0}), (9, {"cmds": 9, "bad": 0}),
+                            (9, {"cmds": 8, "bad": 1})):
+            injector.delivery_verdict(sent, stats)[1].encode("ascii")
+
+    def test_the_dll_reports_both_counters(self):
+        source = (REPO / "hook" / "gbfr_hook.c").read_text(encoding="utf-8")
+        assert "cmds=%ld bad=%ld" in source
+        assert "InterlockedIncrement(&g_nCommands)" in source
+        assert "InterlockedIncrement(&g_nUnknown)" in source
+
+
+class TestFailuresAreNotSilent:
+    """这个仓库最坏的故障形态不是崩溃，是"脚本安静地不干活"（见 ruff.toml 的
+    那段说明）。所以失败必须留下痕迹，而痕迹本身要能被测出来。"""
+
+    def test_a_failed_send_is_logged_at_warning(self, wired, win32,
+                                                warnings_from_injector):
+        win32(write_raises=OSError("pipe is gone"))
+        wired.disconnect = lambda: None
+        assert wired._send("KEY_DOWN:65") is False
+        assert any("发送指令失败" in r.getMessage()
+                   for r in warnings_from_injector), \
+            "发不出去必须喊一声，debug 级别等于没说"
+
+    def test_a_failed_send_drops_the_connection(self, wired, win32):
+        win32(write_raises=OSError("pipe is gone"))
+        calls = []
+        wired.disconnect = lambda: calls.append("disconnect")
+        wired._send("KEY_DOWN:65")
+        assert calls == ["disconnect"]
+
+    def test_the_send_counter_only_counts_what_got_out(self, wired, win32):
+        fake = win32()
+        wired._send("KEY_DOWN:65")
+        wired._send("KEY_UP:65")
+        assert wired.sent_count == 2
+        assert len(fake.written) == 2
+
+    def test_a_failed_send_is_not_counted(self, wired, win32):
+        win32(write_raises=OSError("nope"))
+        wired.disconnect = lambda: None
+        wired._send("KEY_DOWN:65")
+        assert wired.sent_count == 0, "没出去的不能算数，否则分母是假的"
+
+
+class TestDroppedInputIsRecorded:
+    """注入连接一断，is_ready() 就永远是假，之后每一次按键都会被悄悄丢掉。
+    原来那是四个光秃秃的 return —— 使用者看到的是"脚本不动了"，日志里什么都没有。
+    """
+
+    @pytest.fixture
+    def wi(self):
+        from window_input import WindowInput
+        w = WindowInput()
+        w._hwnd = None            # 没窗口 => is_ready() 为假
+        return w
+
+    def test_dropped_input_is_counted(self, wi):
+        wi.key_press("a")
+        wi.key_release("a")
+        wi.mouse_press(1, 2)
+        wi.mouse_release(1, 2)
+        assert wi.dropped_inputs == 4
+
+    def test_the_first_drop_is_loud(self, wi, warnings_from_injector):
+        wi.key_press("a")
+        assert any("输入被丢弃" in r.getMessage() for r in warnings_from_injector)
+
+    def test_it_warns_once_not_once_per_keystroke(self, wi, warnings_from_injector):
+        """按键是高频的。刷屏的日志和没有日志一样没用。"""
+        for _ in range(50):
+            wi.key_press("a")
+        assert len(warnings_from_injector) == 1
+        assert wi.dropped_inputs == 50
+
+
+class TestInjectHandshake:
+    """管道连上 != DLL 收得到指令。
+
+    把这两件事当成一件的代价已经付过一次：#45 那次读答复的代码是坏的，而
+    "命名管道连接成功"照常打印了出来，于是报告把问题记到游戏头上。PING 走的
+    正是 写 -> 读 -> 解析 这条整链，坏在哪一环它都答不上来。
+    """
+
+    def _patch(self, monkeypatch, ping_ok):
+        import os as _os
+
+        import hook.injector as real
+        calls = []
+
+        class FakeClient:
+            last_error = "DLL 没有应答"
+
+            def start_listening(self):
+                return True
+
+            def wait_for_connection(self, timeout_ms=5000):
+                return True
+
+            def ping(self, timeout_ms=None):
+                calls.append(("ping", timeout_ms))
+                return ping_ok
+
+            def is_connected(self):
+                return True
+
+            def disconnect(self):
+                calls.append(("disconnect",))
+
+        monkeypatch.setattr(real, "HookClient", FakeClient)
+        monkeypatch.setattr(real, "inject_dll",
+                            lambda pid, path: calls.append(("inject", pid)))
+        monkeypatch.setattr(real, "hwnd_to_pid", lambda hwnd: 4321)
+        monkeypatch.setattr(_os.path, "exists", lambda p: True)
+        return calls
+
+    def _wi(self):
+        from window_input import WindowInput
+        w = WindowInput()
+        w._hwnd = 4242
+        return w
+
+    def test_a_silent_dll_is_a_failed_injection(self, monkeypatch):
+        calls = self._patch(monkeypatch, ping_ok=False)
+        wi = self._wi()
+        with pytest.raises(RuntimeError, match="PING"):
+            wi.enable_inject()
+        assert ("disconnect",) in calls, "握手失败必须把管道收掉"
+        assert wi.mode == wi.MODE_FALLBACK, \
+            "绝不能带着一条不通的管道宣布注入模式已就绪"
+
+    def test_a_dll_that_answers_enables_inject_mode(self, monkeypatch):
+        calls = self._patch(monkeypatch, ping_ok=True)
+        wi = self._wi()
+        assert wi.enable_inject() is True
+        assert wi.mode == wi.MODE_INJECT
+        assert ("disconnect",) not in calls
+
+    def test_the_handshake_happens_after_the_injection(self, monkeypatch):
+        calls = self._patch(monkeypatch, ping_ok=True)
+        self._wi().enable_inject()
+        names = [c[0] for c in calls]
+        assert names.index("inject") < names.index("ping")
 
 
 class TestTakeLine:

@@ -150,6 +150,8 @@ class WindowInput:
         self._hwnd = None
         self._mode = self.MODE_FALLBACK
         self._hook_client = None
+        self._dropped = 0
+        self._warned_dropped = False
         if hwnd_or_title is not None:
             self.set_target(hwnd_or_title)
 
@@ -191,8 +193,33 @@ class WindowInput:
         rect = win32gui.GetWindowRect(self._hwnd)
         return rect[0] + x, rect[1] + y
 
+    def _ready_or_warn(self, what):
+        """没就绪就等于这次输入被丢掉了。丢了要留痕。
+
+        原来这里是四个光秃秃的 `return`。注入连接一断，之后**每一次**按键都会
+        走到这里、什么都不做、也什么都不说 —— 对使用者来说就是"脚本不动了"，
+        而日志里一个字都没有。这正是 ruff.toml 里记的那类问题：自动化脚本的故障
+        表现为安静地不干活，而不是报错。
+
+        只在第一次喊，之后只计数：按键是高频的，刷屏的日志和没有日志一样没用。
+        """
+        if self.is_ready():
+            return True
+        self._dropped += 1
+        if not self._warned_dropped:
+            self._warned_dropped = True
+            log.warning(
+                "目标未就绪，输入被丢弃 (%s, mode=%s)。这之后的输入也会被丢弃，"
+                "只记数不再重复告警。", what, self._mode)
+        return False
+
+    @property
+    def dropped_inputs(self):
+        """有多少次输入因为"没就绪"被丢掉。0 以外的值都值得看一眼。"""
+        return self._dropped
+
     def key_press(self, key):
-        if not self.is_ready():
+        if not self._ready_or_warn("key_press"):
             return
         if self._mode == self.MODE_INJECT:
             self._hook_client.key_press(_to_vk(key))
@@ -201,7 +228,7 @@ class WindowInput:
             _sys_key(key, True)
 
     def key_release(self, key):
-        if not self.is_ready():
+        if not self._ready_or_warn("key_release"):
             return
         if self._mode == self.MODE_INJECT:
             self._hook_client.key_release(_to_vk(key))
@@ -214,7 +241,7 @@ class WindowInput:
         self.key_release(key)
 
     def mouse_press(self, x, y, button="left"):
-        if not self.is_ready():
+        if not self._ready_or_warn("mouse_press"):
             return
         if self._mode == self.MODE_INJECT:
             sx, sy = self._screen_pos(x, y)
@@ -225,7 +252,7 @@ class WindowInput:
             _sys_mouse(sx, sy, button, True)
 
     def mouse_release(self, x, y, button="left"):
-        if not self.is_ready():
+        if not self._ready_or_warn("mouse_release"):
             return
         if self._mode == self.MODE_INJECT:
             sx, sy = self._screen_pos(x, y)
@@ -306,7 +333,25 @@ class WindowInput:
                 f"DLL 注入成功，但命名管道连接失败: {err or '未知错误'}\n"
                 f"(DLL 可能未正确启动，或管道名称不匹配)"
             )
-        _log("命名管道连接成功，注入模式已就绪")
+        _log("命名管道连接成功，正在与 DLL 握手...")
+
+        # 管道连上 ≠ DLL 收得到指令。把这两件事当成一件，代价已经付过一次了：
+        # #45 那次读答复的代码是坏的，而"命名管道连接成功"照样打印了出来，于是
+        # 报告把问题记在游戏头上，实际上是我们这边一条答复都没读回来过。
+        #
+        # PING 走的正是 写 → 读 → 解析 这条完整链路，坏在哪一环它都答不上来。
+        # 宁可在这里明明白白地失败、退回兼容模式，也不要带着一条只写不通的管道
+        # 宣布"注入模式已就绪"，然后安静地什么都不做。
+        if not self._hook_client.ping(timeout_ms=3000):
+            err = self._hook_client.last_error
+            self._hook_client.disconnect()
+            self._hook_client = None
+            raise RuntimeError(
+                f"管道连上了，但 DLL 没有应答 PING: {err or '未知错误'}\n"
+                f"(没有启用注入模式 —— 这条管道上发出去的按键不会有人收)"
+            )
+
+        _log("DLL 握手成功，注入模式已就绪")
         self._mode = self.MODE_INJECT
         return True
 
@@ -350,6 +395,11 @@ class WindowInput:
             log.warning("观察焦点事件需要先注入并选中窗口")
             return False
         return self._hook_client.spoof_watch(self._hwnd)
+
+    @property
+    def commands_sent(self):
+        """注入通道上写成功了多少条指令。跟 DLL 报的 cmds 对着看才有意义。"""
+        return self._hook_client.sent_count if self._hook_client else 0
 
     def focus_spoof_stats(self):
         """各个钩子被调用了多少次。伪装关着的时候也有效 —— 那就是"只观察"模式。"""
