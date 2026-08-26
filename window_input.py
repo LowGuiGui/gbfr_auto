@@ -150,6 +150,7 @@ class WindowInput:
         self._hwnd = None
         self._mode = self.MODE_FALLBACK
         self._hook_client = None
+        self._spoof_on = False
         self._dropped = 0
         self._warned_dropped = False
         if hwnd_or_title is not None:
@@ -364,6 +365,7 @@ class WindowInput:
                 log.debug("断开前关闭焦点伪装失败", exc_info=True)
             self._hook_client.disconnect()
             self._hook_client = None
+        self._spoof_on = False
         self._mode = self.MODE_FALLBACK
 
     # --- 焦点伪装（#45）-----------------------------------------------------
@@ -377,12 +379,27 @@ class WindowInput:
         if not self._hook_client or self._hwnd is None:
             log.warning("焦点伪装需要先注入并选中窗口")
             return False
-        return self._hook_client.spoof_on(self._hwnd)
+        ok = self._hook_client.spoof_on(self._hwnd)
+        self._spoof_on = bool(ok)
+        return ok
 
     def disable_focus_spoof(self):
+        # 先把标记落下，再去发指令。发失败也不能继续声称"伪装还开着"：调和逻辑
+        # 会据此反复重试关闭，而重试是对的 —— 反过来（发失败却记成已关）会让
+        # 光标一直被锁着，且没人再去管它。
+        self._spoof_on = False
         if not self._hook_client:
             return False
         return self._hook_client.spoof_off()
+
+    @property
+    def spoof_active(self):
+        """焦点伪装当前是不是开着。
+
+        注入连接断了就当它没开 —— DLL 卸载时自己会恢复，而我们也已经没有通道
+        再去关它了。
+        """
+        return bool(self._spoof_on and self._hook_client)
 
     def watch_focus_events(self):
         """只装观察，不开伪装：让窗口消息那三个计数器也能动起来。
