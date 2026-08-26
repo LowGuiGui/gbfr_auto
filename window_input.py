@@ -7,7 +7,6 @@
 
 import time
 import ctypes
-from ctypes import wintypes
 
 import win32con
 import win32gui
@@ -250,7 +249,6 @@ class WindowInput:
     def enable_inject(self, dll_path=None, progress_cb=None):
         import os
         import sys
-        import time as _time
         from hook.injector import (
             HookClient, inject_dll, hwnd_to_pid,
         )

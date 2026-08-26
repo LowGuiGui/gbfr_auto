@@ -5,9 +5,6 @@ DLL 注入 + 命名管道通信
 """
 
 import os
-import ctypes
-import threading
-from ctypes import wintypes
 import win32process
 import win32gui
 import win32con
