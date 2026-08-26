@@ -339,6 +339,18 @@ class WindowInput:
             return False
         return self._hook_client.spoof_off()
 
+    def watch_focus_events(self):
+        """只装观察，不开伪装：让窗口消息那三个计数器也能动起来。
+
+        伪装本身仍然是关的，游戏行为不变。要这一步是因为消息计数器依赖窗口子类
+        化，而子类化原来只在 enable_focus_spoof 里才装 —— 于是"只观察"模式只有
+        轮询那一半是真的在测，另一半结构上永远是 0。
+        """
+        if not self._hook_client or self._hwnd is None:
+            log.warning("观察焦点事件需要先注入并选中窗口")
+            return False
+        return self._hook_client.spoof_watch(self._hwnd)
+
     def focus_spoof_stats(self):
         """各个钩子被调用了多少次。伪装关着的时候也有效 —— 那就是"只观察"模式。"""
         if not self._hook_client:
