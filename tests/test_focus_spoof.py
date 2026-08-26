@@ -236,8 +236,13 @@ class TestSpoofStats:
 class TestPywin32Contract:
     """守住 pywin32 的真实返回形状和异步句柄的调用约定。
 
-    这两条都不是风格问题，各自都足以让**每一条答复都读不回来**，而且都曾经真的
-    发生过 —— 见 2026-08-25 的 gbfr-probe-report.txt，section 9 的 `raw: None`。
+    返回形状那一条是 2026-08-25 那次 `raw: None` 的**确定**原因，见
+    gbfr-probe-report.txt 的 section 9。
+
+    OVERLAPPED 那一条不是那次的元凶：lpOverlapped 为 NULL 时 kernel32 会退回去
+    WaitForSingleObject(hFile, INFINITE)，所以句柄上只有一个 I/O 的时候它看起来
+    是好的。守它是因为那个 INFINITE 意味着根本没有超时，而且句柄上一旦有第二个
+    I/O 就会串线 —— 文档说的"错误地报告操作已完成"。
     """
 
     def test_read_takes_the_data_half_not_the_hr_half(self, wired, win32):

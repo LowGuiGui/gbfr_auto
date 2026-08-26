@@ -26,7 +26,15 @@ PIPE_NAME = r"\\.\pipe\gbfr_hook"
 # 管道是 PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED 建的，于是**后续每一次读写也
 # 必须自带 OVERLAPPED**。微软对 ReadFile 的说法没有余地：句柄是用
 # FILE_FLAG_OVERLAPPED 开的，lpOverlapped 就 "must not be NULL"，否则"函数可能
-# 错误地报告读操作已完成"。原来的同步调用正踩在这一条上。
+# 错误地报告读操作已完成"。
+#
+# 说清楚原来那样写会怎样，免得后人以为这是洁癖：kernel32 在拿到 STATUS_PENDING
+# 而 lpOverlapped 为 NULL 时，会退回去 WaitForSingleObject(hFile, INFINITE)。
+# 于是同一时刻只有一个 I/O 的时候它**能用**，代价是两条：
+#
+#   - 那个等待是 INFINITE。DLL 不回话，探测器就永远挂在那儿，没有超时可言。
+#   - 句柄上一旦同时有第二个 I/O，等到的可能是别人的完成 —— 这正是文档说的
+#     "错误地报告操作已完成"。app 那边有看门狗和工作线程，这不是假设。
 ERROR_IO_PENDING = 997
 
 # 要跟 gbfr_hook.c 里的 BUF_SIZE 对得上。
@@ -321,16 +329,20 @@ class HookClient:
     # --- 管道 I/O -----------------------------------------------------------
     #
     # 这一层是 2026-08-25 那次真机运行里"section 9 拿不到任何计数器"的原因所在。
-    # 原来的读写有两个毛病，每一个单独都足以让**每一条答复都读不回来**：
     #
-    #   1. win32file.ReadFile 返回的是 (hr, data)，代码却按 (data, _) 解包。
-    #      resp 拿到的是那个整数 hr，resp.decode(...) 抛 AttributeError，被
-    #      except 吞掉 —— 对外表现就是干净的一句"拿不到计数器"。
-    #   2. 句柄是 FILE_FLAG_OVERLAPPED 开的，读写却按同步方式调。微软文档对这条
-    #      没有余地：lpOverlapped "must not be NULL"。
+    # 真凶只有一个，而且是确定的：win32file.ReadFile 返回的是 (hr, data)，代码
+    # 却按 (data, _) 解包。resp 拿到的是那个整数 hr，resp.decode(...) 抛
+    # AttributeError，被 except 吞掉 —— 对外表现就是干净的一句"拿不到计数器"。
+    # ping() 同病：`b"PONG" in 0` 抛 TypeError，于是活着的连接被判成死的。
     #
-    # 顺带补上字节管道本来就该有的分行，和一个真的超时 —— DLL 卡住的时候要能报
-    # "没答复"，而不是永远挂在读上面。
+    # 另外两条不是那次的元凶，但都是真的，都得修：
+    #
+    #   - 异步句柄上按同步方式读写。它**看起来**能用（见文件头 ERROR_IO_PENDING
+    #     处的说明），代价是没有超时，以及句柄上同时有第二个 I/O 时会串线。
+    #   - 字节管道没有分行。一次读回来可能是半行，也可能是好几行粘在一起。
+    #
+    # 分清楚这三条要紧：把"看起来能用但很脆"说成"当时就是它坏的"，下一个人就会
+    # 去查一个根本不存在的故障。
 
     def _overlapped_io(self, start, timeout_ms):
         """发起一次 overlapped I/O 并等它真正完成。返回字节数；失败或超时返回 None。
