@@ -835,9 +835,26 @@ def probe_xinput_focus(do_test):
             say("  >> The virtual pad is plugged in but XInput cannot see it.")
             say("     Nothing below would mean anything; stopping here.")
             return
-        slot = slots[0]
 
+        # 先推摇杆，再挑槽位。ViGEm 拔设备不是同步的，上一段（第 5 段）的手柄
+        # 可能还在，于是新的落到 1 号而 0 号留着个恒中立的幽灵 —— 盲取 slots[0]
+        # 就是这样把真机上那次测量整段作废的。
         pad.left_stick_forward()
+        slot = xinput.responding_slot(dll, slots)
+        if slot is None:
+            say("  >> The stick is held down but no slot reports it.")
+            say("     Every reading would be neutral and the verdict would be")
+            say("     meaningless, so stopping here instead of measuring noise.")
+            if len(slots) > 1:
+                say(f"     {len(slots)} slots are occupied -- a pad from an earlier")
+                say("     test may not have finished unplugging. Re-run the probe.")
+            return
+        if slot != slots[0]:
+            say(f"  >> Measuring slot {slot}, not {slots[0]}: only that one responds")
+            say("     to the stick. The others look like leftover devices.")
+        else:
+            say(f"  measuring slot {slot}")
+
         samples = xinput.sample_focus(
             dll, index=slot, seconds=12.0, interval=0.1,
             focus=xinput.baseline_watcher(baseline),
@@ -863,10 +880,10 @@ def probe_xinput_focus(do_test):
     for line in wrap(explanation):
         say(f"    {line}")
 
-    caveat = xinput.focus_caveat(buckets)
+    caveat = xinput.focus_caveat(buckets, code)
     if caveat:
         say()
-        say("  Caveat:")
+        say("  Note on this result:")
         for line in wrap(caveat, 66):
             say(f"    {line}")
 
