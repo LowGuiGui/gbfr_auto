@@ -280,13 +280,73 @@ class TestOwnProcessControl:
 
 
 class TestFocusCaveat:
-    def test_warns_when_we_never_owned_the_foreground(self):
-        caveat = xinput.focus_caveat({"own_process_foreground": 0})
+    """第一版把这条写反了，真机结果回来才发现。方向本身就是被测的东西。"""
+
+    def test_silent_when_we_owned_the_foreground(self):
+        assert xinput.focus_caveat({"own_process_foreground": 5}, "no-os-gate") is None
+        assert xinput.focus_caveat({"own_process_foreground": 5}, "os-gate") is None
+
+    def test_never_foreground_STRENGTHENS_no_os_gate(self):
+        """从来不是前台却读到了 live —— 这是"没有前台门"最强的证据。
+
+        第一版说这种情况下 no-os-gate 可疑，让人白跑一趟去复测一个已经成立的
+        结论。方向反了。
+        """
+        caveat = xinput.focus_caveat({"own_process_foreground": 0}, "no-os-gate")
         assert caveat is not None
+        assert "STRONGER" in caveat
+        assert "WARNING" not in caveat
         caveat.encode("ascii")
 
-    def test_silent_when_we_did(self):
-        assert xinput.focus_caveat({"own_process_foreground": 5}) is None
+    def test_never_foreground_UNDERMINES_os_gate(self):
+        """失焦段全中立、而我们从来不是前台 —— "因为失焦"和"一直如此"分不开。"""
+        caveat = xinput.focus_caveat({"own_process_foreground": 0}, "os-gate")
+        assert caveat is not None
+        assert "WARNING" in caveat
+        caveat.encode("ascii")
 
-    def test_missing_key_is_treated_as_never(self):
-        assert xinput.focus_caveat({}) is not None
+    def test_quiet_on_verdicts_that_already_say_the_run_was_invalid(self):
+        for code in ("no-input", "inconclusive", "mixed"):
+            assert xinput.focus_caveat({"own_process_foreground": 0}, code) is None
+
+    def test_missing_key_is_treated_as_never_foreground(self):
+        assert xinput.focus_caveat({}, "no-os-gate") is not None
+
+
+class TestRespondingSlot:
+    """真机上 slots=[0, 1] 时盲取 0 号，读到上一段留下的幽灵手柄，整段测量作废。"""
+
+    def test_picks_the_slot_that_actually_reports_the_stick(self):
+        dll = _FakeDLL({0: (1, 0), 1: (1, 32767)})
+        assert xinput.responding_slot(dll, [0, 1], sleep=lambda _s: None) == 1
+
+    def test_prefers_a_live_slot_over_an_earlier_neutral_one(self):
+        """顺序不能决定结果 —— 有反应的那个才算。"""
+        dll = _FakeDLL({0: (1, 0), 2: (1, 0), 3: (1, -32768)})
+        assert xinput.responding_slot(dll, [0, 2, 3], sleep=lambda _s: None) == 3
+
+    def test_returns_none_when_nothing_responds(self):
+        """全中立时必须说"不知道"，不能退回 slots[0] 硬测。"""
+        dll = _FakeDLL({0: (1, 0), 1: (1, 0)})
+        assert xinput.responding_slot(dll, [0, 1], sleep=lambda _s: None) is None
+
+    def test_empty_slot_list(self):
+        assert xinput.responding_slot(_FakeDLL({}), [], sleep=lambda _s: None) is None
+
+    def test_retries_because_a_fresh_device_may_not_read_immediately(self):
+        calls = {"n": 0}
+
+        class Warmup:
+            def XInputGetState(self, index, buf):
+                calls["n"] += 1
+                if calls["n"] < 3:
+                    return xinput.ERROR_DEVICE_NOT_CONNECTED
+                buf._obj.Gamepad.sThumbLY = 32767
+                return xinput.ERROR_SUCCESS
+
+        assert xinput.responding_slot(Warmup(), [0], sleep=lambda _s: None) == 0
+
+    def test_gives_up_rather_than_looping_forever(self):
+        dll = _FakeDLL({0: (1, 0)})
+        assert xinput.responding_slot(
+            dll, [0], attempts=2, sleep=lambda _s: None) is None

@@ -164,6 +164,28 @@ def connected_slots(dll, count=MAX_USER_COUNT):
     return [i for i in range(count) if read(dll, i) is not None]
 
 
+def responding_slot(dll, slots, attempts=5, interval=0.1, sleep=time.sleep):
+    """在推着摇杆的前提下，哪个槽位真的报告了非中立数据。
+
+    **不能盲取 slots[0]。** ViGEm 拔掉设备不是同步的：前一段测试的手柄在系统里
+    还没消失时，新插的会落到下一个槽位，而 0 号留着一个读数恒为中立的幽灵。真机
+    上就是这样把一次测量作废的 —— `docs/test2/test a4` 那份报告里 slots=[0, 1]，
+    读了 0 号，于是 120 个采样全中立，判定成 no-input，整段白跑。
+
+    要在**摇杆已经推下去之后**调用，否则每个槽位都是中立的，什么也分不出来。
+    多试几次是因为设备刚插上时状态未必立刻可读。
+
+    找不到返回 None —— 这时候任何读数都不该被当成结论。
+    """
+    for _ in range(attempts):
+        for index in slots:
+            reading = read(dll, index)
+            if reading is not None and not is_neutral(reading):
+                return index
+        sleep(interval)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # 前台判定
 # ---------------------------------------------------------------------------
@@ -334,19 +356,37 @@ def verdict(buckets):
             "gating intermittently -- report the raw counts, do not guess.")
 
 
-def focus_caveat(buckets):
-    """结论要不要打折扣。不需要就返回 None。
+def focus_caveat(buckets, code):
+    """结论要不要加注。不需要就返回 None。
 
-    这条是给"我们这个进程一次都没当过前台"准备的。从终端里跑探测器时，前台窗口
-    属于 conhost / Windows Terminal，不属于我们 —— 如果 XInput 的失焦门真的按
-    进程判定，那它可能从头到尾都是关着的，于是"聚焦"那一栏测的根本不是聚焦。
-    这不会让 os-gate 的结论变错（中立就是中立），但会让 no-os-gate 变得可疑。
+    **这个函数第一版写反了，而且是真机结果回来之后才发现的。** 推理写在这里，
+    免得再翻一次。
+
+    从终端里跑探测器时，控制台窗口属于 conhost / Windows Terminal，不属于我们
+    这个进程 —— 也就是说我们**从头到尾都不是前台**。那么：
+
+      读到的全是 live（no-os-gate）：一个从来不是前台的进程照样读到了真实手柄
+        数据。这恰恰是"不存在前台门"**最强**的证据，不是最弱的。第一版把它当成
+        可疑，正好反了。
+      失焦段全是中立（os-gate）：这才可疑。"聚焦"那一段是按窗口基准判的，不是按
+        "我们是不是前台"判的，而我们从来都不是 —— 于是"因为失焦所以中立"和
+        "一直都是中立"分不开。
+
+    其余判定（inconclusive / no-input / mixed）本身就已经说明测量无效，再加一条
+    注解只会稀释重点。
     """
     if buckets.get("own_process_foreground", 0) > 0:
         return None
-    return ("This process never owned the foreground window -- normal when the probe "
-            "is run from a terminal, because the console window belongs to the "
-            "terminal app. The focused/unfocused split above is still measured "
-            "against the window that was in front when the test started. If the "
-            "result was no-os-gate, re-run by double-clicking the packaged exe "
-            "before trusting it.")
+    if code == "no-os-gate":
+        return ("This process never owned the foreground window -- normal when the "
+                "probe is run from a terminal. That makes this result STRONGER, not "
+                "weaker: a process that was never in front still read live pad data, "
+                "which is exactly what a foreground gate would have prevented.")
+    if code == "os-gate":
+        return ("WARNING: this process never owned the foreground window, so the "
+                "focused rows were measured against whichever window was in front "
+                "when the test started, not against us being in front. 'Neutral "
+                "because unfocused' and 'neutral all along' cannot be told apart "
+                "from this run. Re-run by double-clicking the packaged exe before "
+                "trusting it.")
+    return None

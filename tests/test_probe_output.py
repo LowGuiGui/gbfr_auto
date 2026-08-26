@@ -913,3 +913,125 @@ class TestFocusBehaviourSection:
                   [True, False])
         probe.probe_focus_behaviour(True, 1234)
         capsys.readouterr().out.encode("ascii")
+
+
+class _SlotDLL:
+    """按槽位给不同读数的假 XInput。用来重现"幽灵手柄占着 0 号"。"""
+
+    def __init__(self, live_slots, present_slots):
+        self.live = set(live_slots)
+        self.present = set(present_slots)
+
+    def XInputGetState(self, index, buf):
+        import xinput as _x
+        slot = index.value if hasattr(index, "value") else int(index)
+        if slot not in self.present:
+            return _x.ERROR_DEVICE_NOT_CONNECTED
+        buf._obj.dwPacketNumber = 1
+        buf._obj.Gamepad.sThumbLY = 32767 if slot in self.live else 0
+        return _x.ERROR_SUCCESS
+
+
+class TestSlotSelection:
+    """真机上 slots=[0, 1]、幽灵在 0 号，整段测量被判成 no-input 而作废。"""
+
+    def _arm(self, monkeypatch, dll):
+        pad = _FakePad()
+        monkeypatch.setattr(probe.xinput, "available_libraries",
+                            lambda: [("xinput1_4.dll", dll)])
+        monkeypatch.setattr(probe.xinput, "foreground_window", lambda: 777)
+        monkeypatch.setattr(probe.vigem, "VirtualGamepad", lambda: pad)
+        monkeypatch.setattr("builtins.input", lambda *a: "")
+        monkeypatch.setattr(probe.time, "sleep", lambda _s: None)
+        return pad
+
+    def test_skips_the_ghost_and_measures_the_live_slot(self, capsys, monkeypatch):
+        dll = _SlotDLL(live_slots=[1], present_slots=[0, 1])
+        pad = self._arm(monkeypatch, dll)
+        recorded = {}
+
+        def capture(d, **kw):
+            recorded["index"] = kw["index"]
+            return []
+
+        monkeypatch.setattr(probe.xinput, "sample_focus", capture)
+        probe.probe_xinput_focus(True)
+        out = capsys.readouterr().out
+        assert recorded["index"] == 1, "必须量有反应的那个槽位"
+        assert "Measuring slot 1, not 0" in out
+        assert pad.closed
+
+    def test_normal_case_says_nothing_special(self, capsys, monkeypatch):
+        dll = _SlotDLL(live_slots=[0], present_slots=[0])
+        self._arm(monkeypatch, dll)
+        monkeypatch.setattr(probe.xinput, "sample_focus", lambda d, **kw: [])
+        probe.probe_xinput_focus(True)
+        out = capsys.readouterr().out
+        assert "measuring slot 0" in out
+        assert "not 0" not in out
+
+    def test_stops_when_no_slot_responds_to_the_stick(self, capsys, monkeypatch):
+        """全中立时测下去只会得到一个假的 no-input 判定。"""
+        dll = _SlotDLL(live_slots=[], present_slots=[0, 1])
+        pad = self._arm(monkeypatch, dll)
+        called = {"n": 0}
+
+        def count(d, **kw):
+            called["n"] += 1
+            return []
+
+        monkeypatch.setattr(probe.xinput, "sample_focus", count)
+        probe.probe_xinput_focus(True)
+        out = capsys.readouterr().out
+        assert "no slot reports it" in out
+        assert "finished unplugging" in out
+        assert called["n"] == 0, "不该在没有有效槽位时还去采样"
+        assert pad.closed
+
+    def test_the_stick_goes_down_before_the_slot_is_chosen(self, monkeypatch):
+        """顺序是这个修复的全部 —— 没推之前每个槽位都是中立的。"""
+        order = []
+
+        class Watching(_SlotDLL):
+            def XInputGetState(self, index, buf):
+                order.append("read")
+                return super().XInputGetState(index, buf)
+
+        dll = Watching(live_slots=[0], present_slots=[0])
+        pad = self._arm(monkeypatch, dll)
+        original = pad.left_stick_forward
+
+        def note():
+            order.append("stick")
+            original()
+
+        pad.left_stick_forward = note
+        monkeypatch.setattr(probe.xinput, "sample_focus", lambda d, **kw: [])
+        probe.probe_xinput_focus(True)
+        assert "stick" in order, "摇杆必须被推下去"
+        assert order.index("stick") < len(order) - 1
+        assert order[order.index("stick") + 1] == "read", "推完立刻挑槽位"
+
+
+class TestCaveatDirection:
+    def test_no_os_gate_is_strengthened_not_questioned(self, capsys, monkeypatch):
+        """真机第一次跑就撞上这条：报告让人去复测一个已经成立的结论。"""
+        import xinput as _x
+        dll = _SlotDLL(live_slots=[0], present_slots=[0])
+        pad = _FakePad()
+        monkeypatch.setattr(probe.xinput, "available_libraries",
+                            lambda: [("xinput1_4.dll", dll)])
+        monkeypatch.setattr(probe.xinput, "foreground_window", lambda: 777)
+        monkeypatch.setattr(probe.vigem, "VirtualGamepad", lambda: pad)
+        monkeypatch.setattr("builtins.input", lambda *a: "")
+        monkeypatch.setattr(probe.time, "sleep", lambda _s: None)
+
+        live = _x.Reading(1, 0, 0, 0, 0, 32767, 0, 0)
+        monkeypatch.setattr(probe.xinput, "sample_focus", lambda d, **kw: [
+            _x.Sample(0, True, live, False), _x.Sample(1, False, live, False)])
+
+        probe.probe_xinput_focus(True)
+        out = capsys.readouterr().out
+        assert "verdict: [no-os-gate]" in out
+        assert "STRONGER" in out
+        assert "WARNING" not in out
