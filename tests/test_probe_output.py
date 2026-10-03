@@ -1040,12 +1040,16 @@ class TestCaveatDirection:
 class _FakeWI:
     """WindowInput 的替身，记录被调用的顺序。"""
 
-    def __init__(self, stats="STATS on=0 fg=30 active=0 focus=0 kill=0 act=0 actapp=0",
-                 inject_ok=True, inject_raises=None):
+    def __init__(self, stats="STATS on=0 iat=3 sub=1 cmds=2 bad=0 fg=30 "
+                              "active=0 focus=0 kill=0 act=0 actapp=0",
+                 inject_ok=True, inject_raises=None, watch_ok=True,
+                 commands_sent=2):
+        self.commands_sent = commands_sent
         self.calls = []
         self._stats = stats
         self._inject_ok = inject_ok
         self._inject_raises = inject_raises
+        self._watch_ok = watch_ok
 
     def set_target(self, hwnd):
         self.calls.append(("target", hwnd))
@@ -1059,6 +1063,10 @@ class _FakeWI:
     def focus_spoof_stats(self):
         self.calls.append(("stats",))
         return self._stats
+
+    def watch_focus_events(self):
+        self.calls.append(("watch",))
+        return self._watch_ok
 
     def enable_focus_spoof(self):
         self.calls.append(("spoof_on",))
@@ -1185,8 +1193,82 @@ class TestFocusHookSection:
         assert "verdict: [frozen]" in out
         assert "did not stop the pause" in out
 
+    def test_the_observer_is_armed_before_the_user_alt_tabs(self, monkeypatch):
+        """顺序是硬要求。消息计数器靠窗口子类化，而子类化是 watch 装上的 ——
+        在用户 alt-tab 之后才装，那三个计数器就只能是 0，判定于是永远落在
+        polls 或 no-hooks-hit 上，无论游戏实际在做什么。
+        """
+        wi = _FakeWI()
+        self._arm(monkeypatch, wi, ["inject", "", "n"])
+        probe.probe_focus_hook(True, 1234)
+        names = [c[0] for c in wi.calls]
+        assert names.index("watch") < names.index("stats")
+
+    def test_arming_does_not_turn_spoofing_on(self, monkeypatch):
+        """stage 1 说了"什么都不改"，那就一条 SPOOF_ON 都不能发。"""
+        wi = _FakeWI()
+        self._arm(monkeypatch, wi, ["inject", "", "n"])
+        probe.probe_focus_hook(True, 1234)
+        assert ("spoof_on",) not in wi.calls
+
+    def test_a_failed_arming_is_reported_not_swallowed(self, capsys, monkeypatch):
+        """装不上就是"消息那一半没在测"。不说，读报告的人会把 0 当成结论。"""
+        wi = _FakeWI(watch_ok=False)
+        self._arm(monkeypatch, wi, ["inject", "", "n"])
+        probe.probe_focus_hook(True, 1234)
+        out = capsys.readouterr().out
+        assert "Could not arm" in out
+        assert "the message ones cannot" in out
+
+    def test_the_report_says_whether_commands_landed(self, capsys, monkeypatch):
+        """Python 只能说"写成功了"。cmds 是在管道另一头数的 —— 只有它能说明
+        指令到底有没有到。"""
+        wi = _FakeWI()
+        self._arm(monkeypatch, wi, ["inject", "", "n"])
+        probe.probe_focus_hook(True, 1234)
+        assert "delivery: [delivered]" in capsys.readouterr().out
+
+    def test_commands_that_never_arrived_are_called_out(self, capsys, monkeypatch):
+        """注入模式最坏的形态：管道收下了字节，DLL 一条都没执行，而没有任何地方
+        会说这件事。"""
+        wi = _FakeWI(stats="STATS on=0 iat=3 sub=1 cmds=0 bad=0 fg=30 active=0 "
+                           "focus=0 kill=0 act=0 actapp=0",
+                     commands_sent=7)
+        self._arm(monkeypatch, wi, ["inject", "", "n"])
+        probe.probe_focus_hook(True, 1234)
+        out = capsys.readouterr().out
+        assert "delivery: [not-delivered]" in out
+        assert "going nowhere" in out
+
+    def test_garbled_commands_are_called_out(self, capsys, monkeypatch):
+        wi = _FakeWI(stats="STATS on=0 iat=3 sub=1 cmds=5 bad=2 fg=30 active=0 "
+                           "focus=0 kill=0 act=0 actapp=0")
+        self._arm(monkeypatch, wi, ["inject", "", "n"])
+        probe.probe_focus_hook(True, 1234)
+        assert "delivery: [garbled]" in capsys.readouterr().out
+
+    def test_the_report_says_whether_the_hooks_went_in(self, capsys, monkeypatch):
+        wi = _FakeWI()
+        self._arm(monkeypatch, wi, ["inject", "", "n"])
+        probe.probe_focus_hook(True, 1234)
+        out = capsys.readouterr().out
+        assert "IAT patches=3/3" in out
+        assert "window proc subclassed=yes" in out
+
+    def test_hooks_that_never_installed_stop_before_stage2(self, capsys, monkeypatch):
+        """全零的计数器在这里不是关于游戏的证据 —— 钩子压根没进去。
+        照旧跑 stage 2 只会得到一个看起来像结论的东西。"""
+        wi = _FakeWI(stats="STATS on=0 iat=0 sub=0 fg=0 active=0 focus=0 "
+                           "kill=0 act=0 actapp=0")
+        self._arm(monkeypatch, wi, ["inject", "", "y"])
+        probe.probe_focus_hook(True, 1234)
+        out = capsys.readouterr().out
+        assert "mechanism: [not-installed]" in out
+        assert ("spoof_on",) not in wi.calls
+
     def test_section_output_is_ascii(self, capsys, monkeypatch):
-        wi = _FakeWI(stats="STATS on=0 fg=99 active=0 focus=0 kill=2 act=0 actapp=0")
+        wi = _FakeWI(stats="STATS on=0 iat=0 sub=0 fg=99 active=0 focus=0 "
+                           "kill=2 act=0 actapp=0")
         self._arm(monkeypatch, wi, ["inject", "", "n"])
         probe.probe_focus_hook(True, 1234)
         capsys.readouterr().out.encode("ascii")

@@ -1106,7 +1106,8 @@ def probe_focus_hook(do_test, hwnd):
         say("  READ THIS FIRST. Unlike every other section, it INJECTS A DLL into")
         say("  the game process. Specifically:")
         say("    - it loads hook/gbfr_hook.dll into Granblue Fantasy: Relink")
-        say("    - focus spoofing starts OFF, so stage 1 changes NO behaviour")
+        say("    - focus spoofing starts OFF; stage 1 only counts, and every")
+        say("      message it counts is forwarded to the game untouched")
         say("    - the DLL cannot be unloaded again; it stays until the game exits")
         say("  Stage 2 asks separately before changing anything.")
         return
@@ -1117,6 +1118,8 @@ def probe_focus_hook(do_test, hwnd):
     say()
     say("    - loads hook/gbfr_hook.dll into the game process")
     say("    - spoofing starts OFF: stage 1 only counts, changes nothing")
+    say("    - to count window messages it does subclass the game's window,")
+    say("      which forwards everything untouched while spoofing is off")
     say("    - THE DLL CANNOT BE UNLOADED. It stays until the game exits.")
     say("    - if anything goes wrong, closing the game clears it completely")
     say()
@@ -1168,6 +1171,18 @@ def _focus_hook_stage1(wi, hwnd):
     say()
     say("  --- Stage 1: observe. Spoofing is OFF; nothing changes. ---")
     say()
+
+    # 必须在用户 alt-tab 之前装上。消息计数器靠窗口子类化，而子类化原来只在
+    # SPOOF_ON 里才装 —— stage 1 从不发 SPOOF_ON，于是那三个计数器结构上永远是
+    # 0，判定只可能落在 polls 或 no-hooks-hit 上，无论游戏实际上在做什么。
+    if wi.watch_focus_events():
+        say("  Observer armed: the window-proc counters are now live too.")
+        say("  Spoofing is still OFF -- with it off the subclass only counts,")
+        say("  and forwards every message to the game untouched.")
+    else:
+        say("  >> Could not arm the window-proc observer. The poll counters")
+        say("     below still mean something; the message ones cannot.")
+    say()
     say("  Alt-tab AWAY from the game and BACK, three times. Take your time.")
     say("  The counters record how the game noticed each time.")
     try:
@@ -1180,19 +1195,34 @@ def _focus_hook_stage1(wi, hwnd):
     say(f"  raw: {raw}")
     stats = hook_injector.parse_stats(raw)
     if stats:
+        # 先报"装上了没有"，再报"被调了几次"。两者混在一起看，全零的计数器会
+        # 被读成"游戏不走这条路"，而它同样可能是"钩子根本没进去"。
+        say(f"    installed IAT patches={stats.get('iat', '?')}/3"
+            f"  window proc subclassed={'yes' if stats.get('sub') else 'no'}")
         say(f"    polls    GetForegroundWindow={stats.get('fg', 0)}"
             f"  GetActiveWindow={stats.get('active', 0)}"
             f"  GetFocus={stats.get('focus', 0)}")
         say(f"    messages WM_KILLFOCUS={stats.get('kill', 0)}"
             f"  WM_ACTIVATE={stats.get('act', 0)}"
             f"  WM_ACTIVATEAPP={stats.get('actapp', 0)}")
+
+    # 指令有没有真的走到对面。这一条是在管道**另一头**数出来的，所以它能回答
+    # Python 这边永远回答不了的那个问题：写调用说成功了，DLL 到底收到没有。
+    delivery = hook_injector.delivery_verdict(
+        getattr(wi, "commands_sent", 0), stats)
+    if delivery:
+        say()
+        say(f"  delivery: [{delivery[0]}]")
+        for line in wrap(delivery[1]):
+            say(f"    {line}")
+
     code, explanation = hook_injector.stats_verdict(stats)
     say()
     say(f"  mechanism: [{code}]")
     for line in wrap(explanation):
         say(f"    {line}")
 
-    if code in ("no-hooks-hit", "no-data"):
+    if code in ("no-hooks-hit", "no-data", "not-installed"):
         say()
         say("  Stage 2 would prove nothing from here -- if nothing is being")
         say("  intercepted, turning the spoof on cannot change the outcome.")
